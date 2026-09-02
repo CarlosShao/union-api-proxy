@@ -196,6 +196,22 @@ function loadSession() {
   }
 }
 
+let persistTimer = null;
+let pendingPersist = false;
+
+/** 延迟批量持久化：将多次内存变更合并为一次 DB 写入 */
+function deferPersist() {
+  if (pendingPersist) return;
+  pendingPersist = true;
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    pendingPersist = false;
+    persistPool();
+  }, 500);
+  persistTimer.unref && persistTimer.unref();
+}
+
 /** 把内存态整体写回数据库（账号 + 池配置） */
 function persistPool() {
   if (!state) return;
@@ -228,6 +244,20 @@ function persistPool() {
 }
 
 function saveSession() { persistPool(); }
+
+/** 强制立即持久化（用于服务关闭前） */
+function flushPersist() {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+    pendingPersist = false;
+    persistPool();
+  }
+  // 同步刷新日志缓冲区
+  try { require('./store').flushLogsSync(); } catch { /* ignore */ }
+  // 同步刷新用量缓冲区
+  try { require('./store').flushUsageSync(); } catch { /* ignore */ }
+}
 
 function clearSession() {
   state = emptyPool();
@@ -285,7 +315,8 @@ function updateAccount(id, patch) {
     if (patch.source) acct.source = patch.source;
     if (patch.addedBy) acct.addedBy = patch.addedBy;
   }
-  persistPool();
+  // 异步延迟持久化，避免在请求路径（如 token 刷新）阻塞事件循环
+  deferPersist();
   return acct;
 }
 
@@ -343,7 +374,8 @@ function pickAccount(explicitKey) {
   if (!valid.length) return state.accounts[0];
   const cursor = ((p.cursor || 0) % valid.length + valid.length) % valid.length;
   p.cursor = (cursor + 1) % valid.length;
-  persistPool();
+  // 异步延迟持久化，避免每次请求都阻塞事件循环
+  deferPersist();
   return valid[cursor];
 }
 
@@ -353,7 +385,8 @@ function markUsed(id) {
   if (!acct) return;
   acct.lastUsedAt = Date.now();
   acct.useCount = (acct.useCount || 0) + 1;
-  persistPool();
+  // 异步延迟持久化，避免每次请求都阻塞事件循环
+  deferPersist();
 }
 
 /* ---------------- 兼容旧 API ---------------- */
@@ -412,4 +445,5 @@ module.exports = {
   addAccount, updateAccount, removeAccount,
   isExpiringAuth, pickAccount, markUsed, getActiveAccount,
   isLoggedIn, getSession, setSession, getSessionSource,
+  flushPersist,
 };

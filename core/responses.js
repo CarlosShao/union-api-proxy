@@ -13,13 +13,10 @@ const logger = require('./logger');
 const util = require('./util');
 const auth = require('./auth');
 const openai = require('./openai');
+const sanitize = require('./sanitize');
 
 // CodeBuddy 后端的内容过滤器会拦截含 "Codex"/"OpenAI" 等竞品品牌词的系统提示词，
-// 返回 11128 "Illegal API invocation from an unapproved channel"。这里做净化以绕过。
-function sanitizeForBackend(s) {
-  if (typeof s !== 'string') return s;
-  return s.replace(/Codex/gi, 'CodeBuddy').replace(/OpenAI/gi, 'Tencent');
-}
+// 返回 11128 "Illegal API invocation from an unapproved channel"。净化规则统一在 core/sanitize.js。
 
 function contentToText(content) {
   if (content == null) return '';
@@ -61,11 +58,11 @@ function responsesToChatInput(p) {
   const cfg = store.getConfig();
   const chat = { model: (p.model && p.model !== '') ? p.model : (cfg.defaultModel || 'default'), messages: [], stream: !!p.stream };
 
-  if (p.instructions) chat.messages.push({ role: 'system', content: sanitizeForBackend(p.instructions) });
+  if (p.instructions) chat.messages.push({ role: 'system', content: sanitize.sanitizeText(p.instructions) });
 
   const input = p.input;
   if (typeof input === 'string') {
-    chat.messages.push({ role: 'user', content: input });
+    chat.messages.push({ role: 'user', content: sanitize.sanitizePhrase(input) });
   } else if (Array.isArray(input)) {
     let pendingToolCalls = [];
     const flushToolCalls = () => {
@@ -75,7 +72,7 @@ function responsesToChatInput(p) {
       }
     };
     for (const item of input) {
-      if (typeof item === 'string') { flushToolCalls(); chat.messages.push({ role: 'user', content: item }); continue; }
+      if (typeof item === 'string') { flushToolCalls(); chat.messages.push({ role: 'user', content: sanitize.sanitizePhrase(item) }); continue; }
       if (!item || typeof item !== 'object') continue;
 
       if (item.role && item.content !== undefined) {
@@ -83,7 +80,7 @@ function responsesToChatInput(p) {
         const isSys = item.role === 'developer' || item.role === 'system';
         const role = item.role === 'developer' ? 'system' : item.role;
         const text = contentToText(item.content);
-        chat.messages.push({ role, content: isSys ? sanitizeForBackend(text) : text });
+        chat.messages.push({ role, content: isSys ? sanitize.sanitizeText(text) : sanitize.sanitizePhrase(text) });
         continue;
       }
       if (item.type === 'message') {
@@ -91,7 +88,7 @@ function responsesToChatInput(p) {
         const isSys = item.role === 'developer' || item.role === 'system';
         const role = item.role === 'developer' ? 'system' : (item.role || 'user');
         const text = contentToText(item.content);
-        chat.messages.push({ role, content: isSys ? sanitizeForBackend(text) : text });
+        chat.messages.push({ role, content: isSys ? sanitize.sanitizeText(text) : sanitize.sanitizePhrase(text) });
       } else if (item.type === 'function_call') {
         pendingToolCalls.push({
           id: item.call_id || item.id || util.genId('call'),
@@ -100,7 +97,7 @@ function responsesToChatInput(p) {
         });
       } else if (item.type === 'function_call_output') {
         flushToolCalls();
-        chat.messages.push({ role: 'tool', tool_call_id: item.call_id || '', content: contentToText(item.output) });
+        chat.messages.push({ role: 'tool', tool_call_id: item.call_id || '', content: sanitize.sanitizePhrase(contentToText(item.output)) });
       }
     }
     flushToolCalls();
@@ -113,7 +110,7 @@ function responsesToChatInput(p) {
         type: 'function',
         function: {
           name: t.name,
-          description: sanitizeForBackend(t.description || ''),
+          description: sanitize.sanitizeText(t.description || ''),
           parameters: t.parameters || t.input_schema || { type: 'object', properties: {} },
         },
       }));

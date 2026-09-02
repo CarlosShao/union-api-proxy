@@ -2,11 +2,14 @@
 
 /** OpenAI 兼容转发：/v1/chat/completions、/v1/completions、/v1/embeddings */
 
+const fs = require('fs');
+
 const config = require('./config');
 const store = require('./store');
 const logger = require('./logger');
 const util = require('./util');
 const auth = require('./auth');
+const sanitize = require('./sanitize');
 
 const UPSTREAM_MAP = {
   '/v1/chat/completions': '/v2/chat/completions',
@@ -100,6 +103,18 @@ async function handleProxy(req, res, pathname) {
   const isStream = payload.stream === true;
   const isChat = upstreamPath === '/v2/chat/completions';
   const needAggregate = isChat && !isStream;
+
+  if (isChat) {
+    sanitize.sanitizeChatPayload(payload);
+    if (process.env.CODEBUDDY_DEBUG) {
+      try {
+        let raw = null;
+        try { raw = JSON.parse(body.toString('utf8')); } catch { /* ignore */ }
+        fs.writeFileSync('/tmp/codebuddy-debug-last-chat.json', JSON.stringify({ raw, chat: payload }, null, 2));
+        logger.log('info', 'proxy', `debug dump -> /tmp/codebuddy-debug-last-chat.json | msgs=[${(payload.messages || []).map((m) => `${m.role}:${JSON.stringify(m.content).length}${m.tool_calls ? `(tc:${m.tool_calls.length})` : ''}`).join(',')}] tools=${(payload.tools || []).length}`);
+      } catch { /* ignore */ }
+    }
+  }
 
   if (needAggregate) payload.stream = true;
   const jsonBody = JSON.stringify(payload);

@@ -22,11 +22,93 @@ let db = null;
 let cachedConfig = null;
 let insertCount = 0;
 
+// 异步批量日志缓冲区
+let logBuffer = [];
+let logFlushTimer = null;
+const LOG_BUFFER_SIZE = 20;      // 缓冲区达到此大小时触发写入
+const LOG_FLUSH_INTERVAL = 500;  // 定时刷新间隔（毫秒）
+let logStmt = null;              // 预编译语句缓存
+
+// 异步批量用量记录缓冲区
+let usageBuffer = [];
+let usageFlushTimer = null;
+const USAGE_BUFFER_SIZE = 20;
+const USAGE_FLUSH_INTERVAL = 500;
+let usageStmt = null;
+
+/** 异步批量刷新用量缓冲区到 SQLite */
+function flushUsage() {
+  if (usageBuffer.length === 0) return;
+  const items = usageBuffer;
+  usageBuffer = [];
+  try {
+    const d = getDb();
+    const stmt = usageStmt || (usageStmt = d.prepare(
+      'INSERT INTO usage(id, ts, source, model, stream, account_id, account_name, api_key_id, api_key_name, '
+    + 'prompt_tokens, completion_tokens, total_tokens, cached_tokens, duration_ms, status) '
+    + 'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ));
+    const tx = d.transaction(() => {
+      for (const u of items) {
+        stmt.run(u.id, u.ts, u.source, u.model, u.stream, u.accountId, u.accountName, u.apiKeyId, u.apiKeyName,
+          u.promptTokens, u.completionTokens, u.totalTokens, u.cachedTokens, u.durationMs, u.status);
+      }
+    });
+    tx();
+  } catch { /* 用量写入失败不应影响主流程 */ }
+}
+
+function scheduleUsageFlush() {
+  if (usageFlushTimer) return;
+  usageFlushTimer = setTimeout(() => {
+    usageFlushTimer = null;
+    flushUsage();
+  }, USAGE_FLUSH_INTERVAL);
+  if (usageFlushTimer.unref) usageFlushTimer.unref();
+}
+
+/** 异步批量刷新日志缓冲区到 SQLite */
+function flushLogs() {
+  if (logBuffer.length === 0) return;
+  const logs = logBuffer;
+  logBuffer = [];
+  try {
+    const d = getDb();
+    const stmt = logStmt || (logStmt = d.prepare(
+      'INSERT INTO logs(ts, level, category, message, meta) VALUES(?, ?, ?, ?, ?)'
+    ));
+    const tx = d.transaction(() => {
+      for (const log of logs) {
+        stmt.run(log.ts, log.level, log.category, log.message, log.meta);
+      }
+    });
+    tx();
+    insertCount += logs.length;
+    if (insertCount >= 50) {
+      insertCount = 0;
+      const cfg = getConfig();
+      prune(cfg);
+    }
+  } catch { /* 日志写入失败不应影响主流程 */ }
+}
+
+function scheduleLogFlush() {
+  if (logFlushTimer) return;
+  logFlushTimer = setTimeout(() => {
+    logFlushTimer = null;
+    flushLogs();
+  }, LOG_FLUSH_INTERVAL);
+  if (logFlushTimer.unref) logFlushTimer.unref();
+}
+
 function getDb() {
   if (db) return db;
   const { DatabaseSync } = require('node:sqlite');
   fs.mkdirSync(path.dirname(config.DB_FILE), { recursive: true });
   db = new DatabaseSync(config.DB_FILE);
+  // WAL 模式：提升读写并发性能，减少写入阻塞
+  db.exec('PRAGMA journal_mode = WAL;');
+  db.exec('PRAGMA synchronous = NORMAL;');
   db.exec(`
     CREATE TABLE IF NOT EXISTS logs (
       id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -311,14 +393,29 @@ function addLog(level, category, message, meta) {
   const levels = config.LOG_LEVELS;
   const minIdx = levels.indexOf(cfg['logging.level'] || 'info');
   if (levels.indexOf(level) < minIdx) return;
-  try {
-    const d = getDb();
-    const details = asBool(cfg['logging.details'], true);
-    d.prepare('INSERT INTO logs(ts, level, category, message, meta) VALUES(?, ?, ?, ?, ?)')
-      .run(Date.now(), level, category, message, (details && meta != null) ? JSON.stringify(meta) : null);
-    insertCount += 1;
-    if (insertCount === 1 || insertCount % 50 === 0) prune(cfg);
-  } catch { /* 日志写入失败不应影响主流程 */ }
+  // 异步批量写入：加入缓冲区，不阻塞主线程
+  const details = asBool(cfg['logging.details'], true);
+  logBuffer.push({
+    ts: Date.now(),
+    level,
+    category,
+    message,
+    meta: (details && meta != null) ? JSON.stringify(meta) : null,
+  });
+  if (logBuffer.length >= LOG_BUFFER_SIZE) {
+    // 缓冲区满了，立即刷新
+    if (logFlushTimer) { clearTimeout(logFlushTimer); logFlushTimer = null; }
+    flushLogs();
+  } else {
+    // 否则定时刷新
+    scheduleLogFlush();
+  }
+}
+
+/** 强制刷新所有待处理的日志（用于服务关闭前） */
+function flushLogsSync() {
+  if (logFlushTimer) { clearTimeout(logFlushTimer); logFlushTimer = null; }
+  flushLogs();
 }
 
 function prune(cfg) {
@@ -615,19 +712,36 @@ function recordUsage({
   promptTokens = 0, completionTokens = 0, totalTokens = 0,
   cachedTokens = 0, durationMs = 0, status = 'ok',
 } = {}) {
-  try {
-    getDb().prepare(
-      'INSERT INTO usage(id, ts, source, model, stream, account_id, account_name, api_key_id, api_key_name, ' +
-      'prompt_tokens, completion_tokens, total_tokens, cached_tokens, duration_ms, status) ' +
-      'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-    ).run(
-      genUsageId(), Date.now(), String(source || ''), String(model || ''),
-      stream ? 1 : 0, String(accountId || ''), String(accountName || ''),
-      String(apiKeyId || ''), String(apiKeyName || ''),
-      asInt(promptTokens), asInt(completionTokens), asInt(totalTokens),
-      asInt(cachedTokens), asInt(durationMs), status === 'error' ? 'error' : 'ok'
-    );
-  } catch { /* 用量写入失败不应影响请求 */ }
+  // 异步批量写入：加入缓冲区，不阻塞主线程
+  usageBuffer.push({
+    id: genUsageId(),
+    ts: Date.now(),
+    source: String(source || ''),
+    model: String(model || ''),
+    stream: stream ? 1 : 0,
+    accountId: String(accountId || ''),
+    accountName: String(accountName || ''),
+    apiKeyId: String(apiKeyId || ''),
+    apiKeyName: String(apiKeyName || ''),
+    promptTokens: asInt(promptTokens),
+    completionTokens: asInt(completionTokens),
+    totalTokens: asInt(totalTokens),
+    cachedTokens: asInt(cachedTokens),
+    durationMs: asInt(durationMs),
+    status: status === 'error' ? 'error' : 'ok',
+  });
+  if (usageBuffer.length >= USAGE_BUFFER_SIZE) {
+    if (usageFlushTimer) { clearTimeout(usageFlushTimer); usageFlushTimer = null; }
+    flushUsage();
+  } else {
+    scheduleUsageFlush();
+  }
+}
+
+/** 强制刷新所有待处理的用量记录（用于服务关闭前） */
+function flushUsageSync() {
+  if (usageFlushTimer) { clearTimeout(usageFlushTimer); usageFlushTimer = null; }
+  flushUsage();
 }
 
 function mapUsageRow(r) {
@@ -1198,14 +1312,14 @@ module.exports = {
 
   getConfig, setConfig, publicValues, applyPublicPatch,
   getRequestTimeoutMs, getCorsOrigin, loggingDetailsEnabled,
-  addLog, queryLogs, clearLogs, stats,
+  addLog, flushLogsSync, queryLogs, clearLogs, stats,
 
   // API 密钥
   ensureDefaultApiKey, listApiKeys, listApiKeysPublic, addApiKey,
   regenerateApiKey, removeApiKey, setApiKeyAccount, apiKeyValid, resolveApiKey, clientKeyVerificationEnabled,
 
   // 用量记录
-  recordUsage, queryUsage, usageStatsByDay, usageTotals,
+  recordUsage, flushUsageSync, queryUsage, usageStatsByDay, usageTotals,
 
   // 管理页鉴权
   adminAuthEnabled, adminConfigured, getAdminUser, setAdminPassword, verifyAdminPassword,

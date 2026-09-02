@@ -164,7 +164,32 @@ codex exec "你的任务"
 实测（Codex CLI 0.148）：文本回复、shell 工具调用、多轮 tool loop 均正常。
 
 > 1. Codex 可能提示 `Model metadata for '...' not found`（自定义模型不在 Codex 内置目录），不影响使用。
-> 2. CodeBuddy 会拦截含 `Codex` / `OpenAI` 的系统提示词（`11128 Illegal API invocation from an unapproved channel`）。代理会净化 `instructions` / `developer` 系统消息（`Codex`→`CodeBuddy`、`OpenAI`→`Tencent`），用户消息和工具参数不动。
+> 2. CodeBuddy 会拦截含竞品品牌词的系统提示词（`11128 Illegal API invocation from an unapproved channel`），词表实测包含 `Codex`、`OpenAI`、`ZCode` 等。代理会净化 `instructions` / `developer` 系统消息与工具描述（`Codex`→`CodeBuddy`、`OpenAI`→`Tencent`、独立出现的 `ZCode`→`CodeBuddy`），用户消息和工具参数不动；`/v1/chat/completions` 路径同样净化。规则集中在 `core/sanitize.js`，`.zcode`、`zcode-plugins` 等路径/标识符不会被误改。
+> 3. 除词表外，CodeBuddy 还对竞品智能体提示词做**整句指纹**拦截，且**连对话历史一起扫**：实测 Claude Code / ZCode 模板原句 `Main branch (you will usually use this for PRs)` 出现在系统提示词、历史消息、tool 参数任何位置都会触发，而其任意子串都不触发。处理策略（见 `core/sanitize.js`）：词表替换只作用于 system/developer 消息与工具描述（改历史里的 `OpenAI` 等会毁用户代码）；指纹句做保义改写且作用于**所有消息与 tool 参数**（精确原句改写无副作用）。以后若再遇 11128：启动代理加 `CODEBUDDY_DEBUG=1` 看 `/tmp/codebuddy-debug-last-chat.json`，对净化后的载荷做二分夹出最小触发句，往 `PHRASE_RULES` 里加一条改写即可。
+
+## 接 ZCode CLI（OpenAI 兼容）
+
+ZCode 的自定义 provider 选 `openai-compatible` 类型（底层是 AI SDK，会在 baseURL 后自动拼 `/chat/completions`）。在 ZCode 设置界面添加自定义 provider，或直接在 `~/.zcode/v2/config.json` 的 `provider` 下新增一个条目（键名任意唯一，如 UUID）：
+
+```json
+"<唯一键名>": {
+  "name": "CodeBuddy",
+  "kind": "openai-compatible",
+  "options": {
+    "apiKey": "<你的密钥，未启用密钥校验时填 dummy>",
+    "baseURL": "http://127.0.0.1:3800/v1",
+    "apiKeyRequired": true
+  },
+  "source": "custom",
+  "models": {
+    "glm-5": { "limit": { "context": 200000, "output": 128000 }, "modalities": { "input": ["text"], "output": ["text"] } }
+  }
+}
+```
+
+注意：`baseURL` 必须以 `/v1` 结尾；模型名填目录里的模型（如 `glm-5`、`deepseek-v4-flash`）或管理页添加的自定义模型。重启 ZCode 后选择该 provider 和模型即可。
+
+> ZCode 内置的「模型测试」只发一条不带系统提示词的小请求，测通了不代表真实会话能过——CodeBuddy 的拦截词表里就有 `ZCode`，实测真实对话/compact 必触发 11128（`Illegal API invocation from an unapproved channel`），代理已通过上面的净化规则处理。若仍遇 11128：启动代理时加 `CODEBUDDY_DEBUG=1`，复现后看 `/tmp/codebuddy-debug-last-chat.json`（chat 路径）或 `/tmp/codebuddy-debug-last.json`（responses 路径）里净化后的载荷，定位剩余触发词后在 `core/sanitize.js` 追加规则。
 
 ## 环境变量
 

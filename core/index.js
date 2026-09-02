@@ -109,6 +109,13 @@ function start() {
     }
   });
 
+  // 优雅关闭：刷新日志缓冲区和账号池变更
+  const shutdown = () => {
+    try { sessionMod.flushPersist(); } catch { /* ignore */ }
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+
   return server;
 }
 
