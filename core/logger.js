@@ -21,7 +21,7 @@ function log(level, category, message, meta) {
 
 function requestSummary(payload, extra) {
   const out = { ...(extra || {}) };
-  if (payload && typeof payload !== 'object') {
+  if (payload && typeof payload === 'object') {
     if (payload.stream != null) out.stream = !!payload.stream;
     if (Array.isArray(payload.messages)) out.messages = payload.messages.length;
     if (Array.isArray(payload.tools)) out.tools = payload.tools.length;

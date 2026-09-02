@@ -196,23 +196,7 @@ function loadSession() {
   }
 }
 
-let persistTimer = null;
-let pendingPersist = false;
-
-/** 延迟批量持久化：将多次内存变更合并为一次 DB 写入 */
-function deferPersist() {
-  if (pendingPersist) return;
-  pendingPersist = true;
-  if (persistTimer) return;
-  persistTimer = setTimeout(() => {
-    persistTimer = null;
-    pendingPersist = false;
-    persistPool();
-  }, 500);
-  persistTimer.unref && persistTimer.unref();
-}
-
-/** 把内存态整体写回数据库（账号 + 池配置） */
+/** 把内存态整体写回数据库（账号 + 池配置）。仅用于结构性变更（增删账号、改池配置）。 */
 function persistPool() {
   if (!state) return;
   try {
@@ -245,18 +229,14 @@ function persistPool() {
 
 function saveSession() { persistPool(); }
 
-/** 强制立即持久化（用于服务关闭前） */
+/** 强制刷新各缓冲区（用于服务关闭前）。账号池本就在结构变更时即时落库，无需额外处理。 */
 function flushPersist() {
-  if (persistTimer) {
-    clearTimeout(persistTimer);
-    persistTimer = null;
-    pendingPersist = false;
-    persistPool();
-  }
   // 同步刷新日志缓冲区
-  try { require('./store').flushLogsSync(); } catch { /* ignore */ }
+  try { store.flushLogsSync(); } catch { /* ignore */ }
   // 同步刷新用量缓冲区
-  try { require('./store').flushUsageSync(); } catch { /* ignore */ }
+  try { store.flushUsageSync(); } catch { /* ignore */ }
+  // 同步刷新密钥使用计数缓冲区
+  try { store.flushApiKeyTouches(); } catch { /* ignore */ }
 }
 
 function clearSession() {
@@ -315,8 +295,22 @@ function updateAccount(id, patch) {
     if (patch.source) acct.source = patch.source;
     if (patch.addedBy) acct.addedBy = patch.addedBy;
   }
-  // 异步延迟持久化，避免在请求路径（如 token 刷新）阻塞事件循环
-  deferPersist();
+  // 单行同步落库（微秒级）：token 刷新等场景不再触发 500ms 后的全量池重写（那会在流式响应中途阻塞事件循环）
+  try {
+    store.updateAccountRow(acct.id, {
+      name: acct.name,
+      source: acct.source,
+      addedBy: acct.addedBy || acct.source,
+      account: acct.account,
+      auth: acct.auth,
+      accounts: acct.accounts,
+      autoCheckin: acct.autoCheckin,
+      lastUsedAt: acct.lastUsedAt,
+      useCount: acct.useCount,
+    });
+  } catch (e) {
+    logger.log('error', 'system', '保存账号失败: ' + e.message);
+  }
   return acct;
 }
 
@@ -351,7 +345,16 @@ function setPoolConfig(patch) {
 }
 
 function isExpiringAuth(auth) {
-  if (!auth || !auth.expiresAt) return true;
+  if (!auth) return true;
+  if (!auth.expiresAt) {
+    // 缺少过期时间的账号（如手工导入）：若最近刷新过则视为仍有效。
+    // 否则每个请求都会先做一次 token 刷新网络往返（最长 30s 超时）。
+    const last = typeof auth.lastRefreshTime === 'number'
+      ? auth.lastRefreshTime
+      : Date.parse(auth.lastRefreshTime);
+    if (Number.isFinite(last) && Date.now() - last < config.AUTH_FRESH_MS) return false;
+    return true;
+  }
   const expiresAt = typeof auth.expiresAt === 'number'
     ? (auth.expiresAt > 1e12 ? auth.expiresAt : auth.expiresAt * 1000)
     : Date.parse(auth.expiresAt);
@@ -374,8 +377,7 @@ function pickAccount(explicitKey) {
   if (!valid.length) return state.accounts[0];
   const cursor = ((p.cursor || 0) % valid.length + valid.length) % valid.length;
   p.cursor = (cursor + 1) % valid.length;
-  // 异步延迟持久化，避免每次请求都阻塞事件循环
-  deferPersist();
+  // cursor 只留在内存：轮询游标无需即时落库，重启后归零无害
   return valid[cursor];
 }
 
@@ -385,8 +387,9 @@ function markUsed(id) {
   if (!acct) return;
   acct.lastUsedAt = Date.now();
   acct.useCount = (acct.useCount || 0) + 1;
-  // 异步延迟持久化，避免每次请求都阻塞事件循环
-  deferPersist();
+  // 单行 UPDATE 即时落库（微秒级）。此前走 deferPersist → 500ms 后全量池重写，
+  // 恰好落在流式响应中途阻塞事件循环，是把思考 delta 拉出秒级间隙的主因之一。
+  try { store.touchAccount(id, acct.lastUsedAt, acct.useCount); } catch { /* ignore */ }
 }
 
 /* ---------------- 兼容旧 API ---------------- */

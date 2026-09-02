@@ -110,8 +110,10 @@ async function handleProxy(req, res, pathname) {
       try {
         let raw = null;
         try { raw = JSON.parse(body.toString('utf8')); } catch { /* ignore */ }
-        fs.writeFileSync('/tmp/codebuddy-debug-last-chat.json', JSON.stringify({ raw, chat: payload }, null, 2));
-        logger.log('info', 'proxy', `debug dump -> /tmp/codebuddy-debug-last-chat.json | msgs=[${(payload.messages || []).map((m) => `${m.role}:${JSON.stringify(m.content).length}${m.tool_calls ? `(tc:${m.tool_calls.length})` : ''}`).join(',')}] tools=${(payload.tools || []).length}`);
+        fs.writeFileSync(require('path').join(require('os').tmpdir(), 'codebuddy-debug-last-chat.json'), JSON.stringify({ raw, chat: payload }, null, 2));
+        const rk = Object.keys(payload).filter((k) => /reason|think|effort/i.test(k));
+        const rkv = rk.map((k) => `${k}=${JSON.stringify(payload[k])}`).join(' ');
+        logger.log('info', 'proxy', `debug dump -> ${require('os').tmpdir()}/codebuddy-debug-last-chat.json | msgs=[${(payload.messages || []).map((m) => `${m.role}:${JSON.stringify(m.content).length}${m.tool_calls ? `(tc:${m.tool_calls.length})` : ''}`).join(',')}] tools=${(payload.tools || []).length} | ${rkv}`);
       } catch { /* ignore */ }
     }
   }

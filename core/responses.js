@@ -301,7 +301,7 @@ function streamChatToResponses(clientRes, urlStr, headers, body, originalReq) {
       clientRes.end();
     };
 
-    const req = mod.request(u, { method: 'POST', headers }, (upRes) => {
+    const req = mod.request(u, { method: 'POST', headers, agent: util.agentFor(u.protocol) }, (upRes) => {
       const ct = (upRes.headers['content-type'] || '');
       if (!ct.includes('text/event-stream')) {
         let errBody = '';

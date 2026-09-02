@@ -27,6 +27,8 @@ const ENDPOINT_HOST = (() => { try { return new URL(ENDPOINT).host; } catch { re
 const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const LOGIN_POLL_INTERVAL_MS = 1000;
 const REFRESH_AHEAD_MS = 60 * 1000;
+/** 缺少 expiresAt 的账号在此时间内刷新过则视为 token 有效（避免每请求都触发刷新） */
+const AUTH_FRESH_MS = 10 * 60 * 1000;
 
 const VERSION = (() => {
   try { return require('../package.json').version || '1.0.0'; } catch { return '1.0.0'; }
@@ -78,7 +80,7 @@ const LOG_CATEGORIES = ['system', 'auth', 'proxy', 'responses', 'config'];
 module.exports = {
   PORT, HOST, ENDPOINT, PREFIX_PATH, PLATFORM,
   DATA_DIR, SESSION_FILE, DB_FILE, DIST_DIR, ENDPOINT_HOST,
-  LOGIN_TIMEOUT_MS, LOGIN_POLL_INTERVAL_MS, REFRESH_AHEAD_MS,
+  LOGIN_TIMEOUT_MS, LOGIN_POLL_INTERVAL_MS, REFRESH_AHEAD_MS, AUTH_FRESH_MS,
   VERSION, DEFAULT_CONFIG, LOG_LEVELS, LOG_CATEGORIES,
   ADMIN_USERNAME, ADMIN_PASSWORD, ADMIN_COOKIE, TRUST_PROXY,
   ADMIN_SESSION_TTL_MS, ADMIN_SESSION_RENEW_MS, ADMIN_SCRYPT,

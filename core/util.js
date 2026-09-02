@@ -9,6 +9,12 @@ const path = require('path');
 const crypto = require('crypto');
 const { URL } = require('url');
 
+// 上游连接复用：keep-alive 池化，避免每轮工具调用（尤其长思考空隙后）重新 TCP+TLS 握手
+const HTTP_AGENT = new http.Agent({ keepAlive: true, maxSockets: 16, keepAliveMsecs: 30000 });
+const HTTPS_AGENT = new https.Agent({ keepAlive: true, maxSockets: 16, keepAliveMsecs: 30000 });
+
+function agentFor(protocol) { return protocol === 'https:' ? HTTPS_AGENT : HTTP_AGENT; }
+
 /** JSON 请求，返回 { status, headers, body, json } */
 function requestJson(urlStr, { method = 'GET', headers = {}, body = null, timeoutMs = 30000 } = {}) {
   return new Promise((resolve, reject) => {
@@ -19,7 +25,7 @@ function requestJson(urlStr, { method = 'GET', headers = {}, body = null, timeou
     if (payload != null && !finalHeaders['Content-Type']) finalHeaders['Content-Type'] = 'application/json';
     if (payload != null) finalHeaders['Content-Length'] = Buffer.byteLength(payload);
 
-    const req = mod.request(u, { method, headers: finalHeaders, timeout: timeoutMs }, (res) => {
+    const req = mod.request(u, { method, headers: finalHeaders, timeout: timeoutMs, agent: agentFor(u.protocol) }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
@@ -46,7 +52,7 @@ function requestRaw(urlStr, { method = 'POST', headers = {}, body = null, timeou
     if (payload != null && !finalHeaders['Content-Type']) finalHeaders['Content-Type'] = 'application/json';
     if (payload != null) finalHeaders['Content-Length'] = Buffer.byteLength(payload);
 
-    const req = mod.request(u, { method, headers: finalHeaders, timeout: timeoutMs }, (res) => {
+    const req = mod.request(u, { method, headers: finalHeaders, timeout: timeoutMs, agent: agentFor(u.protocol) }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => resolve({ status: res.statusCode || 0, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }));
@@ -68,7 +74,7 @@ function pipeToClient(clientRes, urlStr, { method = 'POST', headers = {}, body =
     if (payload != null && !finalHeaders['Content-Type']) finalHeaders['Content-Type'] = 'application/json';
     if (payload != null) finalHeaders['Content-Length'] = Buffer.byteLength(payload);
 
-    const upstream = mod.request(u, { method, headers: finalHeaders }, (upRes) => {
+    const upstream = mod.request(u, { method, headers: finalHeaders, agent: agentFor(u.protocol) }, (upRes) => {
       const respHeaders = { ...(upRes.headers || {}), ...extraHeaders };
       clientRes.writeHead(upRes.statusCode || 502, respHeaders);
       upRes.pipe(clientRes);
@@ -85,6 +91,37 @@ function pipeToClient(clientRes, urlStr, { method = 'POST', headers = {}, body =
     if (payload != null) upstream.write(payload);
     upstream.end();
   });
+}
+
+/**
+ * 规范化上游 SSE 事件块。
+ * CodeBuddy 上游的 delta 是"全字段"格式：思考阶段的 chunk 也带 content:""，
+ * 正文阶段也带 reasoning_content:""（另有恒空的 refusal:"" / tool_calls:[]）。
+ * ZCode 的 openai-compatible 转换层（ai-sdk）会因此把每个思考 delta 切成独立的
+ * reasoning 块——UI 表现为一条回复出现几十上百个"思考·持续了几秒"。
+ * 这里把空字符串/空数组字段剥掉，使 delta 只携带有效字段（标准 OpenAI 形态）。
+ * 无需修改的事件按原文返回，零重写成本。
+ */
+function normalizeSseBlock(block) {
+  const lines = block.split('\n').map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) return line;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === '[DONE]') return line;
+    let obj;
+    try { obj = JSON.parse(data); } catch { return line; }
+    const choice = obj && obj.choices && obj.choices[0];
+    const delta = choice && choice.delta;
+    if (!delta || typeof delta !== 'object') return line;
+    let touched = false;
+    for (const k of ['content', 'reasoning_content', 'refusal']) {
+      if (delta[k] === '') { delete delta[k]; touched = true; }
+    }
+    if (Array.isArray(delta.tool_calls) && delta.tool_calls.length === 0) { delete delta.tool_calls; touched = true; }
+    if (delta.function_call === null) { delete delta.function_call; touched = true; }
+    return touched ? 'data: ' + JSON.stringify(obj) : line;
+  });
+  return lines.join('\n');
 }
 
 /**
@@ -105,7 +142,13 @@ function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, bod
     let status = 'ok';
     const report = () => { if (onDone) try { onDone({ usage, status }); } catch { /* ignore */ } };
 
-    const upstream = mod.request(u, { method, headers: finalHeaders }, (upRes) => {
+    // CODEBUDDY_DEBUG 下记录 chunk 间隙：用于定位事件循环停顿 / 上游断流造成的秒级思考分段
+    const debugGaps = !!process.env.CODEBUDDY_DEBUG;
+    const startedAt = Date.now();
+    let lastChunkAt = startedAt;
+    let firstChunk = true;
+
+    const upstream = mod.request(u, { method, headers: finalHeaders, agent: agentFor(u.protocol) }, (upRes) => {
       const respHeaders = { ...(upRes.headers || {}), ...extraHeaders };
       clientRes.writeHead(upRes.statusCode || 502, respHeaders);
       if (upRes.statusCode !== 200) status = 'error';
@@ -113,13 +156,21 @@ function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, bod
       let buf = '';
       upRes.setEncoding('utf8');
       upRes.on('data', (chunk) => {
+        const now = Date.now();
+        if (debugGaps) {
+          const gap = now - lastChunkAt;
+          if (firstChunk) console.log(`[sse-debug] 首字节 TTFB ${gap}ms`);
+          else if (gap >= 500) console.log(`[sse-debug] chunk 间隙 ${gap}ms（事件循环停顿或上游断流）`);
+        }
+        lastChunkAt = now;
+        firstChunk = false;
         buf += chunk;
-        // 边写边解析，尽量低延迟转发
-        clientRes.write(chunk);
         let idx;
+        let out = '';
         while ((idx = buf.indexOf('\n\n')) !== -1) {
           const block = buf.slice(0, idx);
           buf = buf.slice(idx + 2);
+          out += normalizeSseBlock(block) + '\n\n';
           for (const line of block.split('\n')) {
             const t = line.trim();
             if (!t.startsWith('data:')) continue;
@@ -131,9 +182,11 @@ function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, bod
             } catch { /* skip */ }
           }
         }
+        if (out) clientRes.write(out);
       });
       upRes.on('end', () => {
         if (buf.trim()) {
+          clientRes.write(normalizeSseBlock(buf) + '\n\n');
           for (const line of buf.split('\n')) {
             const t = line.trim();
             if (!t.startsWith('data:')) continue;
@@ -253,5 +306,5 @@ function genId(prefix) {
 module.exports = {
   requestJson, requestRaw, pipeToClient, pipeSseToClient, readBody,
   sendJson, sendHtml, sendFile, MIME_TYPES, corsHeaders,
-  escapeHtml, maskedToken, genId,
+  escapeHtml, maskedToken, genId, agentFor,
 };

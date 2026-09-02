@@ -20,7 +20,7 @@ const config = require('./config');
 
 let db = null;
 let cachedConfig = null;
-let insertCount = 0;
+let pruneTimerStarted = false;
 
 // 异步批量日志缓冲区
 let logBuffer = [];
@@ -36,6 +36,21 @@ const USAGE_BUFFER_SIZE = 20;
 const USAGE_FLUSH_INTERVAL = 500;
 let usageStmt = null;
 
+/**
+ * 手写事务：node:sqlite 没有 better-sqlite3 的 db.transaction() API
+ * （此前误用导致 flush 静默失败、日志/用量从未落库），这里用 BEGIN/COMMIT 实现。
+ */
+function withTransaction(d, fn) {
+  d.exec('BEGIN');
+  try {
+    fn();
+    d.exec('COMMIT');
+  } catch (e) {
+    try { d.exec('ROLLBACK'); } catch { /* ignore */ }
+    throw e;
+  }
+}
+
 /** 异步批量刷新用量缓冲区到 SQLite */
 function flushUsage() {
   if (usageBuffer.length === 0) return;
@@ -48,14 +63,13 @@ function flushUsage() {
     + 'prompt_tokens, completion_tokens, total_tokens, cached_tokens, duration_ms, status) '
     + 'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
     ));
-    const tx = d.transaction(() => {
+    withTransaction(d, () => {
       for (const u of items) {
         stmt.run(u.id, u.ts, u.source, u.model, u.stream, u.accountId, u.accountName, u.apiKeyId, u.apiKeyName,
           u.promptTokens, u.completionTokens, u.totalTokens, u.cachedTokens, u.durationMs, u.status);
       }
     });
-    tx();
-  } catch { /* 用量写入失败不应影响主流程 */ }
+  } catch (e) { /* 用量写入失败不应影响主流程 */ console.error('[store] 用量写入失败:', e.message); }
 }
 
 function scheduleUsageFlush() {
@@ -77,19 +91,15 @@ function flushLogs() {
     const stmt = logStmt || (logStmt = d.prepare(
       'INSERT INTO logs(ts, level, category, message, meta) VALUES(?, ?, ?, ?, ?)'
     ));
-    const tx = d.transaction(() => {
+    const tx = () => withTransaction(d, () => {
       for (const log of logs) {
         stmt.run(log.ts, log.level, log.category, log.message, log.meta);
       }
     });
     tx();
-    insertCount += logs.length;
-    if (insertCount >= 50) {
-      insertCount = 0;
-      const cfg = getConfig();
-      prune(cfg);
-    }
-  } catch { /* 日志写入失败不应影响主流程 */ }
+    // 注意：prune（COUNT(*) + 批量 DELETE）开销大，不能挂在 flush 热路径上，
+    // 否则会在流式响应中途阻塞事件循环。改由 scheduleLogPrune 低频执行。
+  } catch (e) { /* 日志写入失败不应影响主流程 */ console.error('[store] 日志写入失败:', e.message); }
 }
 
 function scheduleLogFlush() {
@@ -99,6 +109,18 @@ function scheduleLogFlush() {
     flushLogs();
   }, LOG_FLUSH_INTERVAL);
   if (logFlushTimer.unref) logFlushTimer.unref();
+}
+
+/** 低频日志清理：prune 含 COUNT(*) 与批量 DELETE，开销大，每 10 分钟执行一次而非挂在 flush 热路径 */
+const LOG_PRUNE_INTERVAL = 10 * 60 * 1000;
+function scheduleLogPrune() {
+  if (pruneTimerStarted) return;
+  pruneTimerStarted = true;
+  // 启动 30 秒后先清一次，此后按固定间隔
+  const first = setTimeout(() => prune(getConfig()), 30 * 1000);
+  if (first.unref) first.unref();
+  const t = setInterval(() => prune(getConfig()), LOG_PRUNE_INTERVAL);
+  if (t.unref) t.unref();
 }
 
 function getDb() {
@@ -269,6 +291,7 @@ function getDb() {
       db.exec("ALTER TABLE accounts ADD COLUMN auto_checkin INTEGER NOT NULL DEFAULT 1");
     }
   } catch { /* 表不存在或已就绪则忽略 */ }
+  scheduleLogPrune();
   return db;
 }
 
@@ -582,6 +605,44 @@ function setModelHidden(id, hidden) {
 
 const crypto = require('crypto');
 
+// api_keys 内存缓存：避免每个请求都同步全表扫描；管理端写操作时失效
+let apiKeyCache = null;
+// 命中密钥后的 last_used_at/use_count 更新缓冲：合并为一次批量 UPDATE，避免每请求同步写
+const apiKeyTouchBuffer = new Map();   // id -> { id, count, now }
+let apiKeyTouchTimer = null;
+const API_KEY_TOUCH_FLUSH_INTERVAL = 500;
+
+function loadApiKeyCache() {
+  apiKeyCache = getDb().prepare('SELECT id, name, key, account_id FROM api_keys').all()
+    .map((r) => ({ id: r.id, name: r.name || '', key: r.key, accountId: r.account_id || '' }));
+  return apiKeyCache;
+}
+
+function invalidateApiKeyCache() { apiKeyCache = null; }
+
+function flushApiKeyTouches() {
+  if (apiKeyTouchTimer) { clearTimeout(apiKeyTouchTimer); apiKeyTouchTimer = null; }
+  if (apiKeyTouchBuffer.size === 0) return;
+  const items = Array.from(apiKeyTouchBuffer.values());
+  apiKeyTouchBuffer.clear();
+  try {
+    const d = getDb();
+    const stmt = d.prepare('UPDATE api_keys SET last_used_at = ?, use_count = use_count + ? WHERE id = ?');
+    withTransaction(d, () => {
+      for (const it of items) stmt.run(it.now, it.count, it.id);
+    });
+  } catch (e) { /* 密钥使用计数写入失败不影响主流程 */ console.error('[store] 密钥使用计数写入失败:', e.message); }
+}
+
+function scheduleApiKeyTouchFlush() {
+  if (apiKeyTouchTimer) return;
+  apiKeyTouchTimer = setTimeout(() => {
+    apiKeyTouchTimer = null;
+    flushApiKeyTouches();
+  }, API_KEY_TOUCH_FLUSH_INTERVAL);
+  if (apiKeyTouchTimer.unref) apiKeyTouchTimer.unref();
+}
+
 function generateApiKey() {
   return 'cb-' + crypto.randomBytes(24).toString('hex');
 }
@@ -595,12 +656,14 @@ function ensureDefaultApiKey() {
     if (!exists) {
       d.prepare('INSERT OR IGNORE INTO api_keys(id, name, key, created_at) VALUES(?, ?, ?, ?)')
         .run(genId(), 'legacy', envKey, Date.now());
+      invalidateApiKeyCache();
     }
   }
   const n = d.prepare('SELECT COUNT(*) AS n FROM api_keys').get().n;
   if (n === 0) {
     d.prepare('INSERT INTO api_keys(id, name, key, created_at) VALUES(?, ?, ?, ?)')
       .run(genId(), 'default', generateApiKey(), Date.now());
+    invalidateApiKeyCache();
   }
 }
 
@@ -645,6 +708,7 @@ function addApiKey({ name, key, accountId } = {}) {
   const createdAt = Date.now();
   d.prepare('INSERT INTO api_keys(id, name, key, account_id, created_at) VALUES(?, ?, ?, ?, ?)')
     .run(id, nm, k, aid, createdAt);
+  invalidateApiKeyCache();
   return { key: { id, name: nm, key: maskKey(k), fullKey: k, accountId: aid, createdAt, lastUsedAt: 0, useCount: 0 } };
 }
 
@@ -654,12 +718,14 @@ function regenerateApiKey(id) {
   if (!r) return { error: '未找到该密钥' };
   const k = generateApiKey();
   getDb().prepare('UPDATE api_keys SET key = ? WHERE id = ?').run(k, id);
+  invalidateApiKeyCache();
   return { key: { id: r.id, name: r.name || '', key: maskKey(k), fullKey: k, accountId: r.account_id || '', createdAt: r.created_at, lastUsedAt: r.last_used_at, useCount: r.use_count } };
 }
 
 function removeApiKey(id) {
   const r = getDb().prepare('DELETE FROM api_keys WHERE id = ?').run(id);
   if (r.changes === 0) return { error: '未找到该密钥' };
+  invalidateApiKeyCache();
   return { ok: true, id };
 }
 
@@ -669,6 +735,7 @@ function setApiKeyAccount(id, accountId) {
   if (!existing) return { error: '未找到该密钥' };
   const aid = (accountId && String(accountId).trim()) || '';
   getDb().prepare('UPDATE api_keys SET account_id = ? WHERE id = ?').run(aid, id);
+  invalidateApiKeyCache();
   const updated = getApiKey(id);
   return { key: { id: updated.id, name: updated.name || '', key: maskKey(updated.key), accountId: updated.account_id || '', createdAt: updated.created_at, lastUsedAt: updated.last_used_at, useCount: updated.use_count } };
 }
@@ -678,16 +745,18 @@ function apiKeyValid(provided) {
   return !!resolveApiKey(provided);
 }
 
-/** 返回命中的密钥信息 { id, name, accountId }，未命中返回 null。会更新最近使用。 */
+/** 返回命中的密钥信息 { id, name, accountId }，未命中返回 null。命中计数进缓冲，500ms 批量落库。 */
 function resolveApiKey(provided) {
-  const d = getDb();
-  const rows = d.prepare('SELECT id, name, key, account_id FROM api_keys').all();
+  const rows = apiKeyCache || loadApiKeyCache();
   const b = Buffer.from(String(provided));
   for (const r of rows) {
     const a = Buffer.from(r.key);
     if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
-      d.prepare('UPDATE api_keys SET last_used_at = ?, use_count = use_count + 1 WHERE key = ?').run(Date.now(), r.key);
-      return { id: r.id, name: r.name || '', accountId: r.account_id || '' };
+      const prev = apiKeyTouchBuffer.get(r.id);
+      if (prev) prev.count += 1;
+      else apiKeyTouchBuffer.set(r.id, { id: r.id, count: 1, now: Date.now() });
+      scheduleApiKeyTouchFlush();
+      return { id: r.id, name: r.name, accountId: r.accountId };
     }
   }
   return null;
@@ -969,7 +1038,15 @@ function insertAccount(acct) {
     autoCheckin ? 1 : 0,
     Number(acct.lastUsedAt) || 0, Number(acct.useCount) || 0, createdAt, now
   );
-  return getAccountRow(id);
+  // 不做写后读回：读回会多一次 SELECT + 全字段 JSON.parse，纯浪费（内存态以 session.js 为准）
+  return { id, name, source, addedBy, account, auth, accounts, autoCheckin, lastUsedAt: Number(acct.lastUsedAt) || 0, useCount: Number(acct.useCount) || 0, createdAt };
+}
+
+/** 轻量触碰：仅更新账号的使用时间与次数（单行 UPDATE）。供每请求的 markUsed 调用，避免全量池重写。 */
+function touchAccount(id, lastUsedAt, useCount) {
+  if (!id) return;
+  getDb().prepare('UPDATE accounts SET last_used_at = ?, use_count = ?, updated_at = ? WHERE id = ?')
+    .run(Number(lastUsedAt) || 0, Number(useCount) || 0, Date.now(), id);
 }
 
 /** 更新账号（按 id），patch 支持 name / auth / account / source / addedBy / lastUsedAt / useCount */
@@ -1244,8 +1321,9 @@ function rateLimitCheck(key, { scope = 'admin', maxFails = 8, windowMs = 15 * 60
     r = { key, scope, fails: 0, window_start: now, locked_until: 0 };
   }
   if (!r) {
-    d.prepare('INSERT INTO rate_limits(key, scope, fails, window_start, locked_until) VALUES(?, ?, 0, ?, 0)')
-      .run(key, scope, now);
+    // 尚无记录：直接放行，不预插行。首次失败时 rateLimitRecordFailure 会用 UPSERT 建行，
+    // 避免每个成功请求都经历 INSERT + rateLimitReset(DELETE) 的写抖动。
+    return { allowed: true, retryAfterSec: 0 };
   }
   return { allowed: true, retryAfterSec: 0 };
 }
@@ -1296,7 +1374,7 @@ function setAutoCheckinEnabled(on) {
 
 module.exports = {
   // 账号池（登录态已迁移到 SQLite）
-  listAccountRows, getAccountRow, insertAccount, updateAccountRow, deleteAccountRow, accountCount,
+  listAccountRows, getAccountRow, insertAccount, updateAccountRow, deleteAccountRow, accountCount, touchAccount,
   getAccountPool, setAccountPool, defaultPoolConfig,
 
   // 自动每日签到状态
@@ -1312,7 +1390,7 @@ module.exports = {
 
   getConfig, setConfig, publicValues, applyPublicPatch,
   getRequestTimeoutMs, getCorsOrigin, loggingDetailsEnabled,
-  addLog, flushLogsSync, queryLogs, clearLogs, stats,
+  addLog, flushLogsSync, flushApiKeyTouches, queryLogs, clearLogs, stats,
 
   // API 密钥
   ensureDefaultApiKey, listApiKeys, listApiKeysPublic, addApiKey,
