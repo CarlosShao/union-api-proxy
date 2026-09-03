@@ -15,6 +15,7 @@
 5. **OpenAI 兼容**：`/v1/chat/completions`（流式 + 非流式自动聚合）、`/v1/completions`、`/v1/embeddings`。
 6. **Responses API**：`/v1/responses`，可接 Codex CLI。
 7. **SQLite 日志与配置**：写入 `~/.codebuddy-proxy/proxy.db`，可在管理页查询和改设置。
+8. **CLI 身份模拟**：对话请求完整模拟官方 CLI（`@tencent-ai/codebuddy-code`）的请求头——`User-Agent: CLI/<ver> CodeBuddy/<ver>`、`X-Ide-Type/Name/Version: CLI`、`X-Product: SaaS`、agent / 会话 / 链路追踪 ID 等，服务端控制台的客户端类型因此显示为 **CLI**；每账号 30 分钟闲置内复用同一 `X-Conversation-Id`，轮换节奏与 CLI 会话形态一致。
 
 ## 运行
 
@@ -214,6 +215,7 @@ ZCode 的自定义 provider 选 `openai-compatible` 类型（底层是 AI SDK，
 | `CODEBUDDY_ADMIN_PASSWORD` | 空 | 管理页鉴权初始密码。首次启动时写入并强制首次登录改密；为空则自动生成一次性随机密码并打印到启动日志 |
 | `CODEBUDDY_TRUST_PROXY` | 空（关闭） | 设为 `true` / `1` 才信任反向代理（Cloudflare / nginx）注入的 `X-Forwarded-For`。**未设置时不信任**，限流按直连 IP 计算，防止伪造 XFF 绕过限流 |
 | `CODEBUDDY_DEBUG` | 空 | 把最近一次 Responses 请求 dump 到 `/tmp/codebuddy-debug-last.json` |
+| `CODEBUDDY_CLI_VERSION` | `2.143.0` | CLI 身份模拟使用的版本号（`User-Agent` / `X-Ide-Version`） |
 
 国际版可设 `CODEBUDDY_ENDPOINT=https://www.codebuddy.ai`。
 
@@ -394,6 +396,20 @@ X-User-Id: <uid>
 X-Enterprise-Id / X-Tenant-Id: <enterpriseId>   # 企业版
 X-Domain: <domain>
 ```
+
+对话请求额外模拟官方 CLI 身份（实抓自 `codebuddy` 2.143.0，可被服务端控制台识别为 CLI）：
+
+```
+User-Agent: CLI/2.143.0 CodeBuddy/2.143.0
+X-Ide-Type: CLI  X-Ide-Name: CLI  X-Ide-Version: 2.143.0
+X-Product: SaaS  X-Private-Data: false  X-Codebuddy-Request: 1
+X-Agent-Intent: craft  X-Agent-Purpose: conversation  X-Agent-Type: main
+X-Conversation-Id / X-Request-Id / X-Conversation-Message-Id
+X-Conversation-Request-Id / X-Root-Request-Id / X-Trace-Id
+traceparent / b3 / X-B3-*                                        # 链路追踪
+```
+
+CLI 版本号可用 `CODEBUDDY_CLI_VERSION` 覆盖。
 
 ## 目录
 

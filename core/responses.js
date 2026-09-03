@@ -429,7 +429,7 @@ async function handleResponses(req, res) {
     });
   };
 
-  const headers = { ...auth.buildAuthHeaders(acct), 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
+  const headers = { ...auth.buildChatRequestHeaders(acct), 'Content-Type': 'application/json', 'Accept': 'application/json' };
   const targetUrl = `${config.ENDPOINT}/v2/chat/completions`;
   const jsonBody = JSON.stringify(chatPayload);
   const startedAt = Date.now();

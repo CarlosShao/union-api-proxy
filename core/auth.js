@@ -112,14 +112,80 @@ function extractAccountKey(req, payload) {
   return null;
 }
 
+/**
+ * 官方 CLI（@tencent-ai/codebuddy-code）向 /v2/chat/completions 发送的身份头（实抓自 2.143.0）：
+ * 服务端控制台按 X-Ide-Type / X-Ide-Name / User-Agent 识别客户端类型——
+ * 缺失时显示为"无客户端"，携带时显示为 CLI。
+ */
+const CLI_VERSION = process.env.CODEBUDDY_CLI_VERSION || '2.143.0';
+
+/** 每账号在闲置窗口内复用同一 conversationId，模拟 CLI"一次会话多条请求"的形态；闲置超时后轮换 */
+const CLI_CONVERSATION_IDLE_MS = 30 * 60 * 1000;
+const conversationIds = new Map(); // accountId -> { id, ts }
+
+function hex32() { return crypto.randomBytes(16).toString('hex'); }
+
+function currentConversationId(accountId) {
+  const now = Date.now();
+  const cur = conversationIds.get(accountId);
+  if (cur && now - cur.ts < CLI_CONVERSATION_IDLE_MS) { cur.ts = now; return cur.id; }
+  const id = crypto.randomUUID();
+  conversationIds.set(accountId, { id, ts: now });
+  if (conversationIds.size > 256) {
+    for (const [k, v] of conversationIds) {
+      if (now - v.ts >= CLI_CONVERSATION_IDLE_MS) conversationIds.delete(k);
+    }
+  }
+  return id;
+}
+
 function buildAuthHeaders(acct) {
   const sess = acct || sessionMod.getActiveAccount();
   if (!sess) return {};
   const { account, auth } = sess;
-  const h = { 'Authorization': 'Bearer ' + auth.accessToken, 'X-Requested-With': 'XMLHttpRequest', 'User-Agent': 'CodeBuddy-Proxy/1.0' };
+  // 仅认证与用户标识，不含客户端身份（身份头见 buildChatRequestHeaders；
+  // checkin/credits 会在此基础上覆盖为 WorkBuddy 身份）
+  const h = {
+    'Authorization': 'Bearer ' + auth.accessToken,
+    'X-Requested-With': 'XMLHttpRequest',
+    'User-Agent': `CLI/${CLI_VERSION} CodeBuddy/${CLI_VERSION}`,
+  };
   if (account && account.uid) h['X-User-Id'] = account.uid;
   if (account && account.enterpriseId) { h['X-Enterprise-Id'] = account.enterpriseId; h['X-Tenant-Id'] = account.enterpriseId; }
   if (auth.domain) h['X-Domain'] = auth.domain;
+  return h;
+}
+
+/** 对话类请求头：在认证头之上追加 CLI 身份与每次请求的 agent / 会话 / 链路追踪 ID */
+function buildChatRequestHeaders(acct) {
+  const h = buildAuthHeaders(acct);
+  if (!Object.keys(h).length) return h;
+  h['X-Ide-Type'] = 'CLI';
+  h['X-Ide-Name'] = 'CLI';
+  h['X-Ide-Version'] = CLI_VERSION;
+  h['X-Product'] = 'SaaS';
+  h['X-Private-Data'] = 'false';
+  const conversationId = currentConversationId(acct ? acct.id : 'default');
+  const requestId = hex32();  // CLI: x-request-id 与 x-conversation-message-id 同值
+  const turnId = hex32();     // CLI: x-conversation-request-id / x-root-request-id / trace id 同值
+  const spanId = hex32().slice(0, 16);
+  const parentSpanId = hex32().slice(0, 16);
+  h['X-Agent-Intent'] = 'craft';
+  h['X-Agent-Purpose'] = 'conversation';
+  h['X-Agent-Type'] = 'main';
+  h['X-Codebuddy-Request'] = '1';
+  h['X-Conversation-Id'] = conversationId;
+  h['X-Request-Id'] = requestId;
+  h['X-Conversation-Message-Id'] = requestId;
+  h['X-Conversation-Request-Id'] = turnId;
+  h['X-Root-Request-Id'] = turnId;
+  h['X-Trace-Id'] = turnId;
+  h['traceparent'] = `00-${turnId}-${spanId}-01`;
+  h['b3'] = `${turnId}-${spanId}-1-${parentSpanId}`;
+  h['X-B3-TraceId'] = turnId;
+  h['X-B3-SpanId'] = spanId;
+  h['X-B3-ParentSpanId'] = parentSpanId;
+  h['X-B3-Sampled'] = '1';
   return h;
 }
 
@@ -301,7 +367,8 @@ function verifyClientKey(req) {
 }
 
 module.exports = {
-  buildNoAuthHeaders, buildAuthHeaders, authPath, isExpiring,
+  buildNoAuthHeaders, buildAuthHeaders, buildChatRequestHeaders, authPath, isExpiring,
+  CLI_VERSION,
   refreshToken, getValidAccount, getValidSession,
   pickAccountForRequest, extractAccountKey,
   verifyClientKey,

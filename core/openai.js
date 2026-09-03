@@ -151,9 +151,10 @@ async function handleProxy(req, res, pathname) {
   };
 
   const headers = {
-    ...auth.buildAuthHeaders(acct),
+    ...auth.buildChatRequestHeaders(acct),
     'Content-Type': 'application/json',
-    'Accept': (isStream || needAggregate) ? 'text/event-stream' : 'application/json',
+    // 官方 CLI 即使流式也发 Accept: application/json（服务端按 body.stream 返回 SSE）
+    'Accept': 'application/json',
   };
   const targetUrl = `${config.ENDPOINT}${upstreamPath}`;
   const startedAt = Date.now();
