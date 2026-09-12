@@ -1,21 +1,45 @@
-# CodeBuddy API Proxy
+# Union API Proxy
 
-把 **腾讯云 CodeBuddy** 的账号登录态 / API 代理成 **OpenAI 兼容接口**，供 Cursor、Continue、OpenAI SDK、Codex CLI 等直接调用。
+把 **多渠道**（腾讯云 CodeBuddy、字节跳动 Trae CN）的账号登录态 / API 聚合代理成 **OpenAI 兼容接口**，供 Cursor、Continue、OpenAI SDK、Codex CLI、ZCode 等直接调用。
 
-- **内置 OAuth 登录**：直接在管理页用浏览器完成 CodeBuddy 账号登录（支持多账号账号池）。也可从 VSCode 插件读取登录态、或用 refresh_token 手工导入。
+- **多渠道聚合**：同一份服务同时代理 CodeBuddy 与 Trae CN，按**模型名前缀**路由（`traework/glm-5.2` 走 Trae，无前缀走 CodeBuddy），各渠道有独立的账号池与凭据。
+- **内置 OAuth 登录**：直接在管理页用浏览器完成账号登录（CodeBuddy 与 Trae CN 均支持），支持多账号账号池。
 - 服务端只用 Node 内置模块（含 `node:sqlite`），入口是 `server.js`，逻辑在 `core/`。
 - 管理页是 Vite + Vue 3（Alova 请求、vue-i18n、浅色/深色），构建产物在 `dist/`，**服务启动后从 `dist/` 托管**。
 
+> 本仓库由 CodeBuddy-API-Proxy 演进而来，改为可扩展的多渠道架构。新增渠道只需在 `core/providers/<kind>/` 实现接口并注册一行，转发链路无需改动。
+
 ## 核心特性
 
-1. **内置 OAuth 登录**：管理页「账号管理」里点「添加账号」即弹出浏览器完成 CodeBuddy OAuth 登录，支持添加多个账号组成**账号池**（轮询 / 指定账号两种消耗模式）。首次使用无需任何 VSCode 配置。
-2. **VSCode 登录态读取（可选）**：macOS 上可一键从 VSCode / Cursor 等插件的 SecretStorage 解密 CodeBuddy token 导入账号；也可粘贴 `refresh_token` 手工导入。
-3. **每日自动签到**：账号管理页顶部有全局「自动签到」开关（默认开启），服务端按北京时间每天在随机时间自动执行签到，错过窗口会补签。
-4. **管理页** `http://127.0.0.1:3800/home`：总览、账号、模型、日志、系统配置；中/英文；浅色 / 深色 / 跟随系统。
-5. **OpenAI 兼容**：`/v1/chat/completions`（流式 + 非流式自动聚合）、`/v1/completions`、`/v1/embeddings`。
-6. **Responses API**：`/v1/responses`，可接 Codex CLI。
-7. **SQLite 日志与配置**：写入 `~/.codebuddy-proxy/proxy.db`，可在管理页查询和改设置。
-8. **CLI 身份模拟**：对话请求完整模拟官方 CLI（`@tencent-ai/codebuddy-code`）的请求头——`User-Agent: CLI/<ver> CodeBuddy/<ver>`、`X-Ide-Type/Name/Version: CLI`、`X-Product: SaaS`、agent / 会话 / 链路追踪 ID 等，服务端控制台的客户端类型因此显示为 **CLI**；每账号 30 分钟闲置内复用同一 `X-Conversation-Id`，轮换节奏与 CLI 会话形态一致。
+1. **多渠道聚合**：CodeBuddy + Trae CN 共用一套 `/v1` 接口，靠模型名前缀区分渠道；渠道之间账号池、凭据、池模式完全隔离，不会互相串用。`/v1/models` 只列出**已登录渠道**的模型。
+2. **内置 OAuth 登录**：管理页「账号管理」点「添加账号」即弹出浏览器完成登录。CodeBuddy 用其官方 OAuth 流程；Trae CN 用 PKCE + 本地随机端口回调（不占用官方客户端的 18080，无冲突）。
+3. **VSCode 登录态读取（可选）**：macOS 上可一键从 VSCode / Cursor 等插件的 SecretStorage 解密 CodeBuddy token 导入账号；也可粘贴 `refresh_token` 手工导入。
+4. **每日自动签到**：账号管理页顶部有全局「自动签到」开关（默认开启），服务端按北京时间每天在随机时间自动执行签到，错过窗口会补签。按渠道分派到各自的上游接口。
+5. **管理页** `http://127.0.0.1:3800/home`：总览、账号（按渠道分 tab）、模型（按渠道分组）、日志、系统配置；中/英文；浅色 / 深色 / 跟随系统。
+6. **OpenAI 兼容**：`/v1/chat/completions`（流式 + 非流式自动聚合）、`/v1/completions`、`/v1/embeddings`（后两者仅 CodeBuddy）。
+7. **Responses API**：`/v1/responses`，可接 Codex CLI。
+8. **SQLite 日志与配置**：写入 `~/.union-api-proxy/proxy.db`（可用 `UNION_DATA_DIR` 覆盖），可在管理页查询和改设置。
+9. **CLI 身份模拟**：CodeBuddy 对话请求完整模拟官方 CLI（`@tencent-ai/codebuddy-code`）的请求头——`User-Agent: CLI/<ver> CodeBuddy/<ver>`、`X-Ide-Type/Name/Version: CLI`、`X-Product: SaaS`、agent / 会话 / 链路追踪 ID 等，服务端控制台的客户端类型因此显示为 **CLI**；每账号 30 分钟闲置内复用同一 `X-Conversation-Id`。
+
+## 多渠道路由
+
+模型名前缀即渠道标识（`provider.kind`）：
+
+| 模型名 | 渠道 | 说明 |
+|---|---|---|
+| `glm-5.2` | CodeBuddy | 无前缀 = 默认渠道，旧客户端零改动 |
+| `codebuddy/glm-5.2` | CodeBuddy | 显式指定（`workbuddy/` 为其别名） |
+| `traework/glm-5.2` | Trae CN | 两家都有 `glm-5.2`，靠前缀区分 |
+
+换渠道只需改模型名，`baseURL` 与 API Key 不变。
+
+## Trae CN 接入说明
+
+- **登录**：管理页 → 账号管理 → 切到「Trae CN」tab → 添加账号。代理会监听 `127.0.0.1` 的**随机空闲端口**接收回调，登录成功后账号自动入池。
+- **协议**：走 Trae 的 SOLO 免费通道（`function=solo_work_lite`）。上游是自定义 `event:` 事件流，代理由 `core/providers/traework/sse.js` 转成标准 OpenAI SSE（含 `reasoning_content`、tool_calls 分片合并、usage）。
+- **凭据刷新**：用 `ExchangeToken` 续期，`refreshToken` 轮转后自动持久化。
+- **已知限制**（来自上游，非本代理问题）：通用积分通道可能不可用；部分模型（如 DeepSeek V4 Flash）在上游侧会排队、响应较慢。
+- **与 CodeBuddy 的行为差异**：Trae 侧**不做**竞品品牌词净化——`11128` 拦截是腾讯的机制，Trae 的拦截规则不同，盲目套用词表会改坏用户内容。
 
 ## 运行
 
