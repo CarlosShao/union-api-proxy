@@ -27,16 +27,31 @@ function authPath(sub) { return config.ENDPOINT + '/v2' + config.PREFIX_PATH + s
 
 function isExpiring(auth) { return sessionMod.isExpiringAuth(auth); }
 
+/**
+ * 同一账号的刷新去抖：并发请求同时发现 token 过期时，只让第一个真正发刷新请求，
+ * 其余复用同一次结果。
+ *
+ * 必要性：Trae 的 refreshToken 每次刷新都会轮转（旧的立即失效），若两个请求
+ * 并发刷新，后一个用已被替换的 refreshToken 去换会失败，甚至让账号掉线。
+ */
+const refreshing = new Map();
+
 /** 刷新指定账号的 token，并写回池（按账号所属渠道分发） */
 async function refreshToken(acct) {
   if (!acct) throw new Error('账号不存在');
   const provider = require('./providers/all').getProvider(acct.provider || 'codebuddy');
   if (!provider || typeof provider.refreshToken !== 'function') throw new Error('该渠道不支持刷新 token');
-  const next = await provider.refreshToken(acct);
-  if (!next || !next.accessToken) throw new Error('刷新 token 失败：上游未返回 accessToken');
-  acct.auth = next;
-  sessionMod.updateAccount(acct.id, { auth: next });
-  return acct.auth;
+  const key = acct.id || (acct.account && acct.account.uid) || 'unknown';
+  if (refreshing.has(key)) return refreshing.get(key);
+  const task = (async () => {
+    const next = await provider.refreshToken(acct);
+    if (!next || !next.accessToken) throw new Error('刷新 token 失败：上游未返回 accessToken');
+    acct.auth = next;
+    sessionMod.updateAccount(acct.id, { auth: next });
+    return acct.auth;
+  })().finally(() => { refreshing.delete(key); });
+  refreshing.set(key, task);
+  return task;
 }
 
 /** 校验并（必要时）刷新某个账号，返回该账号对象 */

@@ -144,6 +144,9 @@ async function handleProxy(req, res, pathname) {
 
   if (needAggregate) payload.stream = true;
   const jsonBody = JSON.stringify(payload);
+  // 记录用户原始请求形态：上游只支持流式，非流式是本地聚合的，
+  // 若用改写后的 payload.stream 会把非流式请求误记为流式。
+  const recordStream = isStream;
 
   const accountKey = auth.extractAccountKey(req, payload);
   let acct;
@@ -162,7 +165,7 @@ async function handleProxy(req, res, pathname) {
     store.recordUsage({
       source: pathname,
       model: payload.model || '',
-      stream: !!payload.stream,
+      stream: recordStream,
       accountId, accountName,
       apiKeyId: keyCheck.keyId || '', apiKeyName: keyCheck.keyName || '',
       promptTokens: usage && usage.prompt_tokens,

@@ -56,16 +56,24 @@ function resolveModel(modelStr) {
   const raw = typeof modelStr === 'string' ? modelStr.trim() : '';
   const def = defaultKind();
   if (!raw) return { provider: def, kind: def, model: '' };
-  const idx = raw.indexOf('/');
+  // 去掉前导斜杠等畸形写法（如 '/glm-5.2'），否则会原样发给上游导致参数错误
+  const cleaned = raw.replace(/^\/+/, '');
+  if (!cleaned) return { provider: def, kind: def, model: '' };
+  const idx = cleaned.indexOf('/');
   if (idx > 0) {
-    const head = raw.slice(0, idx);
-    const rest = raw.slice(idx + 1);
-    if (rest && registry.has(head)) return { provider: head, kind: head, model: rest };
-    // 别名：workbuddy 指向 codebuddy
-    const alias = head === 'workbuddy' ? 'codebuddy' : null;
-    if (rest && alias && registry.has(alias)) return { provider: alias, kind: alias, model: rest };
+    const head = cleaned.slice(0, idx);
+    const rest = cleaned.slice(idx + 1);
+    if (rest) {
+      // 渠道标识不区分大小写（用户可能从别处复制来大写写法）
+      const lower = head.toLowerCase();
+      if (registry.has(lower)) return { provider: lower, kind: lower, model: rest };
+      // 别名：workbuddy 指向 codebuddy
+      if (lower === 'workbuddy' && registry.has('codebuddy')) {
+        return { provider: 'codebuddy', kind: 'codebuddy', model: rest };
+      }
+    }
   }
-  return { provider: def, kind: def, model: raw };
+  return { provider: def, kind: def, model: cleaned };
 }
 
 /** 渠道显示名（用于日志/管理页） */
