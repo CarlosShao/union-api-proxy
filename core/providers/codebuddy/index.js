@@ -29,9 +29,44 @@ function staticModels() {
   }));
 }
 
-/** 列表接口由本地目录（+ 管理页自定义模型）提供，无需请求上游 */
-async function listModels() {
-  return staticModels();
+/**
+ * 动态拉取账号可用模型（GET /console/enterprises/personal/models）。
+ * 返回的 data.models 含完整元数据（上下文长度、输出上限、是否支持工具/图片/推理），
+ * 比插件里逆向出来的静态表更新、更准确（随账号权益变化）。
+ *
+ * 过滤规则：排除非对话模型（如 tags 含 text-to-image 的文生图模型）；
+ * tags 里带 badge: 前缀的是营销标签（限时免费等），予以剔除后保留其余标签。
+ */
+async function listModels(acct) {
+  const a = await auth.getValidAccount(acct);
+  const headers = Object.assign(auth.buildAuthHeaders(a), { Accept: 'application/json' });
+  const r = await util.requestJson(config.ENDPOINT + '/console/enterprises/personal/models', {
+    method: 'GET', headers, timeoutMs: 20000,
+  });
+  const list = r.json && r.json.data && r.json.data.models;
+  if (!Array.isArray(list) || !list.length) {
+    const msg = r.json ? (r.json.msg || r.json.code) : String(r.body || '').slice(0, 120);
+    throw new Error('模型列表解析失败: ' + msg);
+  }
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  return list
+    .filter((m) => {
+      const tags = Array.isArray(m.tags) ? m.tags : [];
+      // 文生图等非对话模型不纳入（无法用于 chat/completions）
+      if (tags.some((t) => /text-to-image|text-to-video|text-to-speech|embedding/i.test(String(t)))) return false;
+      return !!m.id;
+    })
+    .map((m) => ({
+      id: m.id,
+      name: m.name || m.id,
+      maxInputTokens: num(m.maxInputTokens),
+      maxOutputTokens: num(m.maxOutputTokens),
+      tools: !!m.supportsToolCall,
+      vision: !!m.supportsImages,
+      reasoning: !!m.supportsReasoning,
+      onlyReasoning: !!m.onlyReasoning,
+      isDefault: !!m.isDefault,
+    }));
 }
 
 /**

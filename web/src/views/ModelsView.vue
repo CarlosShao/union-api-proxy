@@ -36,11 +36,10 @@ const grouped = computed(() => {
     }));
 });
 
-/** 模型对外 id：带渠道前缀（由后端返回 key；兜底用 provider 拼） */
+/** 模型对外 id（后端返回 key；兜底同样按「渠道/模型」拼接，与后端规则保持一致） */
 function modelId(m) {
   if (m.key) return m.key;
-  const p = m.provider || 'codebuddy';
-  return p === 'codebuddy' ? m.id : p + '/' + m.id;
+  return (m.provider || 'codebuddy') + '/' + m.id;
 }
 
 /* ---- 新增 / 编辑模型弹窗 ---- */

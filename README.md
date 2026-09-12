@@ -23,13 +23,17 @@
 
 ## 多渠道路由
 
-模型名前缀即渠道标识（`provider.kind`）：
+模型名前缀即渠道标识（`provider.kind`）。`/v1/models` 列出的 id **一律带前缀**，便于区分同名模型：
 
 | 模型名 | 渠道 | 说明 |
 |---|---|---|
-| `glm-5.2` | CodeBuddy | 无前缀 = 默认渠道，旧客户端零改动 |
-| `codebuddy/glm-5.2` | CodeBuddy | 显式指定（`workbuddy/` 为其别名） |
+| `codebuddy/glm-5.2` | CodeBuddy | 标准写法（`workbuddy/` 为其别名） |
 | `traework/glm-5.2` | Trae CN | 两家都有 `glm-5.2`，靠前缀区分 |
+| `glm-5.2` | CodeBuddy | 无前缀 = 默认渠道，**旧客户端配置继续可用** |
+
+前缀只影响「列出与选择」；请求解析对无前缀写法向后兼容，因此已有配置无需改动。
+
+模型列表**优先动态拉取**各渠道账号的真实可用模型（CodeBuddy 走 `/console/enterprises/personal/models`，Trae 走 `get_detail_param`），带 1 小时缓存，失败时回退内置静态表。因此列表会随账号权益自动更新。
 
 换渠道只需改模型名，`baseURL` 与 API Key 不变。
 
