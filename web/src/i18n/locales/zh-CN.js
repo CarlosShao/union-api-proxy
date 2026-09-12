@@ -182,7 +182,7 @@ export default {
     proxy: '代理',
     proxyDesc: '上游请求与跨域相关设置',
     requestTimeout: '请求超时（秒）',
-    requestTimeoutDesc: '转发到 CodeBuddy 上游时的超时时间',
+    requestTimeoutDesc: '转发到上游渠道时的超时时间',
     corsOrigin: 'CORS Origin',
     corsOriginDesc: '允许的浏览器来源，默认 *。仅在需要跨域访问管理 API 时修改',
     corsOriginPlaceholder: '* 或 https://example.com',

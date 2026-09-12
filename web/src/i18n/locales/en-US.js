@@ -182,7 +182,7 @@ export default {
     proxy: 'Proxy',
     proxyDesc: 'Upstream request and CORS settings',
     requestTimeout: 'Request timeout (seconds)',
-    requestTimeoutDesc: 'Timeout used when forwarding to CodeBuddy',
+    requestTimeoutDesc: 'Timeout used when forwarding to the upstream channel',
     corsOrigin: 'CORS Origin',
     corsOriginDesc: 'Allowed browser origin. Default is *. Change only if you call admin APIs cross-origin',
     corsOriginPlaceholder: '* or https://example.com',

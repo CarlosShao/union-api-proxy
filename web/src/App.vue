@@ -55,6 +55,11 @@ const pageTitle = computed(() => {
   if (route.meta?.title) return t(`nav.${route.meta.title}`);
   return t('app.title');
 });
+
+// 同步浏览器标签页标题（index.html 里的静态标题只作为首屏兜底）
+watch(pageTitle, (title) => {
+  document.title = title ? `${title} · ${t('app.title')}` : t('app.title');
+}, { immediate: true });
 </script>
 
 <template>
