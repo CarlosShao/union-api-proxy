@@ -107,7 +107,22 @@ async function listModels(acct) {
     const disp = cfg.display_config || {};
     if (disp.is_custom_model || name.startsWith('custom_model_')) continue; // 第三方代理模型需额外授权
     seen.add(name);
-    out.push({ id: name, name: disp.display_name || name });
+    // 元数据分两处：
+    //   context_window_tokens.dev     —— 上下文窗口（顶层）
+    //   model_detail_list[0]          —— max_tokens（输出上限）、prompt_max_tokens 等
+    //     （model_name 形如 'glm-5.3__dev'，dev 是计费通道标记，不带就是按 mode 分的通用值）
+    const detail = Array.isArray(cfg.model_detail_list) ? (cfg.model_detail_list[0] || {}) : {};
+    const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+    out.push({
+      id: name,
+      name: disp.display_name || name,
+      maxInputTokens: num(cfg.context_window_tokens && cfg.context_window_tokens.dev),
+      maxOutputTokens: num(detail.max_tokens),
+      tools: true,                      // SOLO 通道的模型均支持 function call
+      vision: !!disp.multimodal,
+      reasoning: String(disp.model_capability || '').includes('reasoning'),
+      isDefault: !!cfg.is_default,
+    });
   }
   return out;
 }

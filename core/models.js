@@ -100,10 +100,16 @@ function modelsResponse(customModels, hiddenIds, extra) {
   const now = Math.floor(Date.now() / 1000);
   const data = allModels(customModels, hiddenIds, extra)
     .filter((m) => !m.hidden)
-    .map((m) => ({
-      id: modelKey(m), object: 'model', created: now, owned_by: m.provider || 'codebuddy',
-      name: m.name, is_default: !!m.isDefault,
-    }));
+    .map((m) => {
+      const entry = {
+        id: modelKey(m), object: 'model', created: now, owned_by: m.provider || 'codebuddy',
+        name: m.name, is_default: !!m.isDefault,
+      };
+      // 上下文/输出上限（无数据则不输出该字段，避免客户端误判为 0）
+      if (m.maxInputTokens > 0) entry.context_length = m.maxInputTokens;
+      if (m.maxOutputTokens > 0) entry.max_output_tokens = m.maxOutputTokens;
+      return entry;
+    });
   return { object: 'list', data };
 }
 
