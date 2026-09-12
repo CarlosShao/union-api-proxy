@@ -18,6 +18,7 @@ const auth = require('./auth');
 const openai = require('./openai');
 const responses = require('./responses');
 const providers = require('./providers/all');
+const modelCache = require('./providers/modelCache');
 const checkin = require('./checkin');
 const checkinScheduler = require('./checkinScheduler');
 const credits = require('./credits');
@@ -84,7 +85,7 @@ function statusObject() {
       expiresAt: active.auth.expiresAt || 0,
       expiresInSeconds: active.auth.expiresAt ? Math.round((active.auth.expiresAt - Date.now()) / 1000) : 0,
     } : null,
-    models: models.allModels(store.listModels(), store.getHiddenModels(), providers.staticModelsByProvider()),
+    models: models.allModels(store.listModels(), store.getHiddenModels(), modelCache.extraModelsForAllProviders()),
   };
 }
 
@@ -122,16 +123,13 @@ function accountsPayload(provider) {
 /**
  * /v1/models 的响应：只列出「已有账号的渠道」的模型。
  * 未登录任何账号的渠道不应出现（避免客户端选到用不了的模型）；默认渠道始终保留，保持旧客户端行为不变。
+ * 非默认渠道优先用动态拉取的真实模型列表（静态表仅作兜底）。
  */
 function modelsResponseForLoggedInProviders() {
-  const defaultKind = providers.defaultKind();
-  const allStatic = providers.staticModelsByProvider();
-  const extra = {};
-  for (const [kind, list] of Object.entries(allStatic)) {
-    if (kind === defaultKind) continue;
-    if (sessionMod.isLoggedIn(kind)) extra[kind] = list;
-  }
-  return models.modelsResponse(store.listModels(), store.getHiddenModels(), extra);
+  return models.modelsResponse(
+    store.listModels(), store.getHiddenModels(),
+    modelCache.extraModelsForAllProviders({ onlyLoggedIn: true })
+  );
 }
 
 function parseBoolFlag(v) {
@@ -155,7 +153,7 @@ function configResponse() {
     options: {
       levels: config.LOG_LEVELS,
       categories: config.LOG_CATEGORIES,
-      models: models.allModels(store.listModels(), store.getHiddenModels(), providers.staticModelsByProvider()).map((m) => ({ id: models.modelKey(m), name: m.name, hidden: !!m.hidden, provider: m.provider || "codebuddy" })),
+      models: models.allModels(store.listModels(), store.getHiddenModels(), modelCache.extraModelsForAllProviders()).map((m) => ({ id: models.modelKey(m), name: m.name, hidden: !!m.hidden, provider: m.provider || "codebuddy" })),
     },
   };
 }
@@ -207,10 +205,27 @@ function serveDist(res, pathname) {
 
 /* ============================ 路由 ============================ */
 
+/**
+ * 容忍客户端漏写 /v1 前缀。
+ * 部分客户端（如 ZCode 的自定义 provider）会把 baseURL 直接拼上 /chat/completions，
+ * 若用户 baseURL 填成 http://host:port（漏了 /v1），就会打到 /chat/completions 而 404。
+ * 这里把裸 OpenAI 路径映射到 /v1/* 等价路径，避免该陷阱。
+ * 注意：/models 不在此列 —— 它有自己的路由（Accept 为 HTML 时回退到管理页 SPA）。
+ */
+const BARE_V1_ALIASES = {
+  '/chat/completions': '/v1/chat/completions',
+  '/completions': '/v1/completions',
+  '/embeddings': '/v1/embeddings',
+  '/responses': '/v1/responses',
+};
+
 async function route(req, res) {
   const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const pathname = u.pathname;
+  let pathname = u.pathname;
   const method = req.method || 'GET';
+
+  // 兼容漏写 /v1 的 baseURL（仅 POST 类接口，避免影响静态资源与 SPA 路由）
+  if (BARE_V1_ALIASES[pathname]) pathname = BARE_V1_ALIASES[pathname];
 
   if (method === 'OPTIONS') {
     res.writeHead(204, util.corsHeaders());
@@ -744,13 +759,13 @@ async function route(req, res) {
     if (accept.includes('text/html')) { serveIndex(res); return; }
     const keyCheck = auth.verifyClientKey(req);
     if (!keyCheck.ok) { util.sendJson(res, keyCheck.rateLimited ? 429 : 401, { error: { message: keyCheck.message, type: 'authentication_error' } }); return; }
-    util.sendJson(res, 200, models.modelsResponse(store.listModels(), store.getHiddenModels(), providers.staticModelsByProvider()));
+    util.sendJson(res, 200, models.modelsResponse(store.listModels(), store.getHiddenModels(), modelCache.extraModelsForAllProviders()));
     return;
   }
 
   /* ---- 自定义模型管理 API ---- */
   if (pathname === '/api/models' && method === 'GET') {
-    util.sendJson(res, 200, { models: models.allModels(store.listModels(), store.getHiddenModels(), providers.staticModelsByProvider()) });
+    util.sendJson(res, 200, { models: models.allModels(store.listModels(), store.getHiddenModels(), modelCache.extraModelsForAllProviders()) });
     return;
   }
   if (pathname === '/api/models' && method === 'POST') {
