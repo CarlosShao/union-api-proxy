@@ -13,6 +13,7 @@ const util = require('./util');
 const sessionMod = require('./session');
 const vscode = require('./vscode');
 const routes = require('./routes');
+const providers = require('./providers/all');
 const checkinScheduler = require('./checkinScheduler');
 const creditScheduler = require('./creditScheduler');
 
@@ -64,23 +65,30 @@ function start() {
     }
 
     console.log('');
-    console.log('  CodeBuddy API Proxy 已启动');
+    console.log('  Union API Proxy 已启动');
     console.log('  ------------------------------------');
     console.log(`  管理页:     http://${config.HOST}:${config.PORT}/home`);
     console.log(`  OpenAI 基址: http://${config.HOST}:${config.PORT}/v1`);
-    console.log(`  后端:       ${config.ENDPOINT}`);
-    if (sessionMod.isLoggedIn()) {
-      const accounts = sessionMod.listAccounts();
-      const pool = sessionMod.getPoolConfig();
-      const active = sessionMod.getActiveAccount();
-      const sourceText = sessionMod.getSessionSource() === 'vscode' ? 'VSCode 插件' : sessionMod.getSessionSource() === 'oauth' ? '网页登录' : '本地缓存';
-      console.log(`  账号池:     ${accounts.length} 个账号, 模式: ${pool.mode === 'pinned' ? '指定账号' : '池模式'}`);
-      for (const a of accounts) console.log(`    - ${a.name || a.account.nickname || a.account.uid}${pool.pinnedId === a.id ? ' (当前指定)' : ''}`);
-      console.log(`  活跃账号:   ${active ? (active.name || active.account.nickname || active.account.uid) : '-'} (来源: ${sourceText})`);
-      if (vs && vs.strategy) console.log(`  解密策略:   ${vs.strategy}`);
-    } else {
-      console.log(`  登录状态:   未登录（请打开管理页登录）`);
+    console.log(`  后端:       ${config.ENDPOINT} (${providers.labelOf(providers.defaultKind())})`);
+    // 逐渠道打印账号池状态（各渠道有独立账号池与凭据）
+    const kinds = providers.providerKinds();
+    const counts = sessionMod.accountCountsByProvider();
+    const defaultKind = providers.defaultKind();
+    for (const kind of kinds) {
+      const label = providers.labelOf(kind);
+      const list = sessionMod.listAccounts(kind);
+      const pool = sessionMod.getPoolConfig(kind);
+      const prefix = kind === defaultKind ? '(默认，无前缀模型)' : `(前缀 ${kind}/)`;
+      if (!list.length) {
+        console.log(`  ${label}:      未登录 ${prefix}`);
+        continue;
+      }
+      console.log(`  ${label}:      ${list.length} 个账号 ${prefix}, 模式: ${pool.mode === 'pinned' ? '指定账号' : '池模式'}`);
+      for (const a of list) {
+        console.log(`    - ${a.name || (a.account && (a.account.nickname || a.account.uid)) || a.id}${pool.pinnedId === a.id ? ' (当前指定)' : ''}`);
+      }
     }
+    if (sessionMod.isLoggedIn() && vs && vs.strategy) console.log(`  解密策略:   ${vs.strategy}`);
     console.log(`  session:    ${config.SESSION_FILE}`);
     console.log(`  数据库:     ${config.DB_FILE}`);
     const keyEnabled = store.clientKeyVerificationEnabled();
