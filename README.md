@@ -2,7 +2,9 @@
 
 把 **多渠道**（腾讯云 CodeBuddy、字节跳动 Trae CN）的账号登录态 / API 聚合代理成 **OpenAI 兼容接口**，供 Cursor、Continue、OpenAI SDK、Codex CLI、ZCode 等直接调用。
 
-- **多渠道聚合**：同一份服务同时代理 CodeBuddy 与 Trae CN，按**模型名前缀**路由（`traework/glm-5.2` 走 Trae，无前缀走 CodeBuddy），各渠道有独立的账号池与凭据。
+> **上手指南见 [USAGE.md](USAGE.md)**（安装、添加账号、接入客户端、常见问题）；本 README 侧重架构与协议细节。
+
+- **多渠道聚合**：同一份服务同时代理 CodeBuddy 与 Trae CN，按**模型名前缀**路由（`tc/glm-5.2` 走 Trae，`cc/glm-5.2` 走 CodeBuddy，无前缀走默认渠道），各渠道有独立的账号池与凭据。
 - **内置 OAuth 登录**：直接在管理页用浏览器完成账号登录（CodeBuddy 与 Trae CN 均支持），支持多账号账号池。
 - 服务端只用 Node 内置模块（含 `node:sqlite`），入口是 `server.js`，逻辑在 `core/`。
 - 管理页是 Vite + Vue 3（Alova 请求、vue-i18n、浅色/深色），构建产物在 `dist/`，**服务启动后从 `dist/` 托管**。
@@ -23,24 +25,26 @@
 
 ## 多渠道路由
 
-模型名前缀即渠道标识（`provider.kind`）。`/v1/models` 列出的 id **一律带前缀**，便于区分同名模型：
+模型名前缀即渠道标识（`provider.kind` 的对外短前缀）。`/v1/models` 列出的 id **一律带前缀**，便于区分同名模型：
 
 | 模型名 | 渠道 | 说明 |
 |---|---|---|
-| `codebuddy/glm-5.2` | CodeBuddy | 标准写法（`workbuddy/` 为其别名） |
-| `traework/glm-5.2` | Trae CN | 两家都有 `glm-5.2`，靠前缀区分 |
+| `cc/glm-5.2` | CodeBuddy | 对外短前缀 `cc`（`codebuddy/`、`workbuddy/` 写法继续兼容） |
+| `tc/glm-5.2` | Trae CN | 对外短前缀 `tc`（旧写法 `traework/`、`tw/` 继续兼容） |
 | `glm-5.2` | CodeBuddy | 无前缀 = 默认渠道，**旧客户端配置继续可用** |
 
-前缀只影响「列出与选择」；请求解析对无前缀写法向后兼容，因此已有配置无需改动。
+前缀只影响「列出与选择」；请求解析对新旧前缀与无前缀写法都向后兼容，因此已有配置无需改动。
 
-模型列表**优先动态拉取**各渠道账号的真实可用模型（CodeBuddy 走 `/console/enterprises/personal/models`，Trae 走 `get_detail_param`），带 1 小时缓存，失败时回退内置静态表。因此列表会随账号权益自动更新。
+模型列表**优先动态拉取**各渠道账号的真实可用模型（CodeBuddy 走 `/console/enterprises/personal/models`，Trae 走 `batch_get_detail_param` + 模型定价表），带 1 小时缓存，失败时回退内置静态表。因此列表会随账号权益自动更新。
 
 换渠道只需改模型名，`baseURL` 与 API Key 不变。
 
 ## Trae CN 接入说明
 
 - **登录**：管理页 → 账号管理 → 切到「Trae CN」tab → 添加账号。代理会监听 `127.0.0.1` 的**随机空闲端口**接收回调，登录成功后账号自动入池。
-- **协议**：走 Trae 的 SOLO 免费通道（`function=solo_work_lite`）。上游是自定义 `event:` 事件流，代理由 `core/providers/traework/sse.js` 转成标准 OpenAI SSE（含 `reasoning_content`、tool_calls 分片合并、usage）。
+- **协议**：走 Trae 的 SOLO 免费通道（默认 `function=solo_work_lite`）。上游是自定义 `event:` 事件流，代理由 `core/providers/traework/sse.js` 转成标准 OpenAI SSE（含 `reasoning_content`、tool_calls 分片合并、usage）。
+- **模型列表**：与官方客户端同源——定价表（`work.trae.cn/api/remote/v1/models`，客户端选择器的权威来源）+ 批量场景表（`batch_get_detail_param`，提供上下文/输出等元数据）。chat 时按模型所属场景自动映射 `function`（免费 lite 通道优先）。
+- **客户端指纹**：`X-Ide-Version / X-Ide-Version-Code` 决定上游下发哪套模型场景表——**不同指纹的表内容不同**（实测 2026-09：旧指纹 `0.1.52/20260811` 的表含 glm-5.3 系列，新客户端的 `3.3.74/20260630` 反而没有）。升级指纹前必须实测模型表，否则会导致部分模型 4001。
 - **凭据刷新**：用 `ExchangeToken` 续期，`refreshToken` 轮转后自动持久化。
 - **已知限制**（来自上游，非本代理问题）：通用积分通道可能不可用；部分模型（如 DeepSeek V4 Flash）在上游侧会排队、响应较慢。
 - **与 CodeBuddy 的行为差异**：Trae 侧**不做**竞品品牌词净化——`11128` 拦截是腾讯的机制，Trae 的拦截规则不同，盲目套用词表会改坏用户内容。
@@ -126,7 +130,7 @@ CODEBUDDY_NO_OPEN=1 npm start
 
 ## 数据文件
 
-默认都在 `~/.codebuddy-proxy/`（可用 `CODEBUDDY_DATA_DIR` 覆盖）：
+默认都在 `~/.union-api-proxy/`（可用 `UNION_DATA_DIR` 或旧名 `CODEBUDDY_DATA_DIR` 覆盖）：
 
 | 文件 | 说明 |
 |---|---|
@@ -231,9 +235,9 @@ ZCode 的自定义 provider 选 `openai-compatible` 类型（底层是 AI SDK，
 | `CODEBUDDY_ENDPOINT` | `https://copilot.tencent.com` | 后端地址 |
 | `CODEBUDDY_PREFIX_PATH` | `/plugin` | 认证接口前缀 |
 | `CODEBUDDY_PLATFORM` | `VSCode` | 平台标识 |
-| `CODEBUDDY_DATA_DIR` | `~/.codebuddy-proxy` | 数据目录 |
-| `CODEBUDDY_SESSION_FILE` | `~/.codebuddy-proxy/session.json` | 会话文件 |
-| `CODEBUDDY_DB_FILE` | `~/.codebuddy-proxy/proxy.db` | SQLite 数据库 |
+| `UNION_DATA_DIR`（旧名 `CODEBUDDY_DATA_DIR`） | `~/.union-api-proxy` | 数据目录 |
+| `CODEBUDDY_SESSION_FILE` | `~/.union-api-proxy/session.json` | 会话文件 |
+| `CODEBUDDY_DB_FILE` | `~/.union-api-proxy/proxy.db` | SQLite 数据库 |
 | `CODEBUDDY_TZ` | `Asia/Shanghai` | 自动签到使用的时区（按该时区的自然日与 05:00–09:00 窗口） |
 | `CODEBUDDY_FORCE_MODEL` | 空 | 强制替换请求 model |
 | `CODEBUDDY_DEFAULT_MODEL` | `default` | 缺省 model |
@@ -334,10 +338,10 @@ curl -b /tmp/cbp-admin.cookie http://127.0.0.1:3800/api/config
 
 ```bash
 # 临时关闭鉴权（然后重启，进入管理页改密后再打开）
-sqlite3 ~/.codebuddy-proxy/proxy.db "UPDATE config SET value='false' WHERE key='adminAuthEnabled';"
+sqlite3 ~/.union-api-proxy/proxy.db "UPDATE config SET value='false' WHERE key='adminAuthEnabled';"
 
 # 或删除管理员记录后重启，会重新生成初始密码并打印到启动日志
-sqlite3 ~/.codebuddy-proxy/proxy.db "DELETE FROM admin_users; DELETE FROM admin_sessions;"
+sqlite3 ~/.union-api-proxy/proxy.db "DELETE FROM admin_users; DELETE FROM admin_sessions;"
 ```
 
 ## 接口

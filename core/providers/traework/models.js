@@ -13,13 +13,16 @@
 /**
  * 静态兜底模型表。
  *
- * 仅在 `get_detail_param` 动态拉取失败时使用。上游的 config_info_list 才是权威列表
- * （随账号权益变化），此处按实测结果维护，避免兜底时列出账号实际拿不到的模型。
- * 元数据取自实测：context_window_tokens.dev（上下文）与 model_detail_list[0].max_tokens（输出）。
+ * 仅在动态拉取（批量场景表 + 定价表）失败时使用。上游返回才是权威列表
+ * （随账号权益与客户端指纹变化），此处按实测结果维护，避免兜底时列出账号
+ * 实际拿不到的模型。
  *
- * 实测来源：Trae CN 账号 2026-09 的 get_detail_param 返回。
+ * 实测来源：2026-09-12 Trae CN 账号 batch_get_detail_param + /api/remote/v1/models
+ * （旧指纹 0.1.52/20260811 下，glm-5.3 系列在 solo_agent 场景可对话）。
+ * glm-5.3-flash 的 1M 上下文取自客户端 Max 模式宣传口径，API 元数据暂未提供。
  */
 const STATIC_MODELS = [
+  { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', maxInputTokens: 1000000, maxOutputTokens: 32000, tools: true, vision: true, reasoning: true },
   { id: 'glm-5.3', name: 'GLM-5.3', maxInputTokens: 200000, maxOutputTokens: 32000, tools: true, vision: false, reasoning: true },
   { id: 'glm-5.2', name: 'GLM-5.2', maxInputTokens: 200000, maxOutputTokens: 32000, tools: true, vision: false, reasoning: true },
   { id: 'glm-5-turbo', name: 'GLM-5-Turbo', maxInputTokens: 200000, maxOutputTokens: 32000, tools: true, vision: false, reasoning: true },
@@ -42,6 +45,16 @@ const STATIC_MODELS = [
 ];
 
 /**
+ * 已知元数据修正（仅填充动态列表中缺失的字段，不覆盖上游实测值）。
+ * glm-5.3-flash 的 1M 上下文来自客户端 Max 模式宣传口径，API 元数据暂未提供。
+ * chatFunction：flash 只在 solo_agent 场景的对话表里（旧指纹实测），启动即需正确
+ * 映射，否则动态列表拉取前的请求会落到默认 solo_work_lite 而 4001。
+ */
+const MODEL_OVERRIDES = {
+  'glm-5.3-flash': { maxInputTokens: 1000000, chatFunction: 'solo_agent' },
+};
+
+/**
  * 返回静态模型（统一为 ModelInfo 结构）。
  * 无 contextWindow/maxTokens 数据时留 0，由 /v1/models 决定是否输出该字段。
  */
@@ -57,4 +70,4 @@ function staticModels() {
   }));
 }
 
-module.exports = { STATIC_MODELS, staticModels };
+module.exports = { STATIC_MODELS, MODEL_OVERRIDES, staticModels };

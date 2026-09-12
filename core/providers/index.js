@@ -5,8 +5,9 @@
  *
  * 设计要点
  * --------
- * 1. **kind 即模型前缀**：`traework/glm-5.2` 中的 `traework` 就是 kind；无前缀的模型
- *    解析为默认渠道（codebuddy），保证旧客户端零改动。
+ * 1. **kind 即渠道标识**：对外的模型短前缀（`cc/`、`tw/`）由 EXTERNAL_PREFIX 映射自
+ *    kind；请求解析两种写法都接受。无前缀的模型解析为默认渠道（codebuddy），
+ *    保证旧客户端零改动。
  * 2. **能力可选**：provider 只需实现自己支持的成员。路由/调度器用
  *    `typeof p.checkin === 'function'` 探测，未实现即视为该渠道不支持签到，
  *    而不是抛错。Trae 有签到、未来某渠道没有，就少写一个函数即可。
@@ -48,7 +49,10 @@ function defaultKind() {
 /**
  * 解析模型串 -> { provider, kind, model }。
  *   'glm-5.2'            -> codebuddy/glm-5.2（无前缀 = 默认渠道，向后兼容）
- *   'workbuddy/glm-5.2'  -> codebuddy/glm-5.2（显式别名）
+ *   'cc/glm-5.2'         -> codebuddy/glm-5.2（对外短前缀）
+ *   'codebuddy/glm-5.2'  -> codebuddy/glm-5.2（内部 kind 写法，继续兼容）
+ *   'workbuddy/glm-5.2'  -> codebuddy/glm-5.2（历史别名）
+ *   'tc/glm-5.2'         -> traework/glm-5.2（对外短前缀；旧写法 tw/ 也兼容）
  *   'traework/glm-5.2'   -> traework/glm-5.2
  * 含 '/' 但首段不是已知渠道时，整个串当作模型名交给默认渠道（模型名本身可能含斜杠）。
  */
@@ -64,13 +68,13 @@ function resolveModel(modelStr) {
     const head = cleaned.slice(0, idx);
     const rest = cleaned.slice(idx + 1);
     if (rest) {
-      // 渠道标识不区分大小写（用户可能从别处复制来大写写法）
+      // 前缀不区分大小写（用户可能从别处复制来大写写法）
       const lower = head.toLowerCase();
+      // 别名优先：对外短前缀 cc/tw 与历史别名 workbuddy -> 内部 kind
+      const aliased = PREFIX_ALIASES[lower];
+      if (aliased && registry.has(aliased)) return { provider: aliased, kind: aliased, model: rest };
+      // 内部 kind 直接作前缀的写法（codebuddy/traework）继续可用
       if (registry.has(lower)) return { provider: lower, kind: lower, model: rest };
-      // 别名：workbuddy 指向 codebuddy
-      if (lower === 'workbuddy' && registry.has('codebuddy')) {
-        return { provider: 'codebuddy', kind: 'codebuddy', model: rest };
-      }
     }
   }
   return { provider: def, kind: def, model: cleaned };
@@ -82,9 +86,23 @@ function labelOf(kind) {
   return p ? (p.label || kind) : kind;
 }
 
-/** 对外模型 id = kind + '/' + 裸模型 id */
+/**
+ * 对外短前缀（用户可见）：cc=codebuddy、tc=traework。
+ * 内部 kind 与 DB 的 provider 列保持原值不变，短前缀只用于对外 id 的展示与解析。
+ */
+const EXTERNAL_PREFIX = { codebuddy: 'cc', traework: 'tc' };
+
+/** 请求侧前缀别名 -> 内部 kind（新短前缀、旧 tw 写法与历史写法都接受） */
+const PREFIX_ALIASES = { cc: 'codebuddy', tc: 'traework', tw: 'traework', workbuddy: 'codebuddy' };
+
+/** 内部 kind -> 对外短前缀（未登记的渠道原样返回，行为同旧版） */
+function externalPrefixOf(kind) {
+  return EXTERNAL_PREFIX[kind] || kind || '';
+}
+
+/** 对外模型 id = 短前缀 + '/' + 裸模型 id（如 cc/glm-5.2、tw/glm-5.3） */
 function modelIdOf(kind, id) {
-  return kind + '/' + id;
+  return externalPrefixOf(kind) + '/' + id;
 }
 
 /**
@@ -107,7 +125,7 @@ function staticModelsByProvider() {
 
 module.exports = {
   register, getProvider, listProviders, providerKinds,
-  defaultKind, resolveModel, labelOf, modelIdOf, staticModelsByProvider,
+  defaultKind, resolveModel, labelOf, modelIdOf, externalPrefixOf, staticModelsByProvider,
 };
 
 /* ------------------------------------------------------------------

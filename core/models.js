@@ -12,6 +12,9 @@
  * 通过 allModels() 与内置目录合并后对外暴露。
  */
 
+/** 对外短前缀（cc/tc）的映射来源；providers/index 不反向依赖本文件，无循环 */
+const providers = require('./providers');
+
 /** 内置兜底目录（实测自上游 models 接口，仅国内模型） */
 const MODEL_CATALOG = [
   // —— 默认 / 自动 ——
@@ -53,11 +56,11 @@ const MODEL_CATALOG = [
 
 /**
  * 把内置目录与数据库中的自定义模型合并（自定义模型覆盖同 provider+id 内置项）。
- * hiddenIds：被隐藏的模型「对外 id」集合。多渠道下对外 id 形如 `traework/glm-5.2`；
- * 默认渠道（codebuddy）保持裸 id 不变，保证旧客户端零改动。
+ * hiddenIds：被隐藏的模型「对外 id」集合。多渠道下对外 id 形如 `tc/glm-5.2`；
+ * 兼容多种历史写法：新短前缀（tc/xxx）、tw 短前缀、内部 kind 前缀（traework/xxx）与裸 id。
  *
  * customModels 可带 provider 字段（缺省 codebuddy）。
- * extra：其它渠道的内置模型 { traework: [ModelInfo, ...] }。
+ * extra：其它渠道的内置模型 { traework: [ModelInfo, ...] }（key 为内部 kind）。
  *
  * /api/* 管理接口返回全部（含 hidden 标记）；/v1/models 与 /models 过滤 hidden 后返回。
  */
@@ -66,8 +69,8 @@ function allModels(customModels, hiddenIds, extra) {
   const byKey = new Map();
   const put = (m, provider, builtin) => {
     const p = provider || m.provider || 'codebuddy';
-    const key = p + '/' + m.id;
-    byKey.set(key, { ...m, provider: p, builtin: !!builtin, key });
+    const key = providers.externalPrefixOf(p) + '/' + m.id;
+    byKey.set(key, { ...m, provider: p, builtin: !!builtin, key, legacyKey: p + '/' + m.id });
   };
 
   for (const m of MODEL_CATALOG) put(m, 'codebuddy', true);
@@ -78,22 +81,21 @@ function allModels(customModels, hiddenIds, extra) {
 
   const list = Array.from(byKey.values()).map((m) => ({
     ...m,
-    // 隐藏标记兼容两种写法：带前缀（新）与裸 id（旧数据），避免升级后旧设置失效
-    hidden: hidden.has(m.key) || hidden.has(m.id),
+    // 隐藏标记兼容多种写法：当前短前缀（cc/tc）、内部 kind 前缀与裸 id（含改名前的旧数据）
+    hidden: hidden.has(m.key) || hidden.has(m.legacyKey) || hidden.has(m.id),
   }));
   // 稳定排序：仅把 hidden 项移到末尾，不改变其它项的原始相对顺序
   return list.filter((m) => !m.hidden).concat(list.filter((m) => m.hidden));
 }
 
 /**
- * 模型的对外 id：始终带渠道前缀（如 codebuddy/glm-5.2、traework/glm-5.3）。
+ * 模型的对外 id：始终带渠道短前缀（如 cc/glm-5.2、tc/glm-5.3）。
  *
  * 前缀只影响「对外展示与选择」；请求解析（providers.resolveModel）仍接受
- * 无前缀写法并将其归属默认渠道，因此旧客户端配置的裸模型名继续可用。
+ * 无前缀写法与旧前缀（codebuddy/traework/workbuddy），旧客户端配置继续可用。
  */
 function modelKey(m) {
-  const p = m.provider || 'codebuddy';
-  return p + '/' + m.id;
+  return providers.externalPrefixOf(m.provider || 'codebuddy') + '/' + m.id;
 }
 
 function modelsResponse(customModels, hiddenIds, extra) {
@@ -102,7 +104,8 @@ function modelsResponse(customModels, hiddenIds, extra) {
     .filter((m) => !m.hidden)
     .map((m) => {
       const entry = {
-        id: modelKey(m), object: 'model', created: now, owned_by: m.provider || 'codebuddy',
+        id: modelKey(m), object: 'model', created: now,
+        owned_by: providers.externalPrefixOf(m.provider || 'codebuddy'),
         name: m.name, is_default: !!m.isDefault,
       };
       // 上下文/输出上限（无数据则不输出该字段，避免客户端误判为 0）

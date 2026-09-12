@@ -86,45 +86,205 @@ function buildChatBody(payload) {
   return preparePayload(payload);
 }
 
-/** 拉取模型列表（get_detail_param），按 config_name 去重并过滤自定义模型 */
+/** 从模型条目提取统一元数据（供 batch 场景表解析用） */
+function num(v) { return Number.isFinite(Number(v)) ? Number(v) : 0; }
+
+/** context_window_tokens 取所有 key 的最大值（dev/max 等计费通道，Max 模式可达 1M） */
+function maxContextWindow(cwt) {
+  if (!cwt || typeof cwt !== 'object') return 0;
+  let max = 0;
+  for (const k of Object.keys(cwt)) max = Math.max(max, num(cwt[k]));
+  return max;
+}
+
+/** 模型是否为第三方自定义代理模型（需额外授权，不对外展示） */
+function isCustomModel(name, disp) {
+  return !!(disp.is_custom_model || String(name).startsWith('custom_model_'));
+}
+
+/**
+ * 拉取模型列表（客户端模型选择器的同款双数据源）：
+ *   1. /api/remote/v1/models  —— 模型定价表，即 SOLO 选择器的权威列表
+ *     （新模型会先出现在这里，如 glm-5.3-flash；不含内部工具模型，天然干净）
+ *   2. batch_get_detail_param —— 各 function 场景的对话配置表，仅用作元数据增强
+ *     （context_window_tokens / max_tokens / multimodal / 场景归属）
+ * 每个模型记录首选 chat function（lite 免费通道优先），供 preparePayload 映射。
+ * 定价表失败时回退为「批量表按对话场景过滤」；两者都失败才抛出（由调用方回退静态表）。
+ */
 async function listModels(acct) {
+  const [pricingR, batchR] = await Promise.allSettled([
+    fetchPricingModels(acct),
+    fetchBatchModels(acct),
+  ]);
+  if (pricingR.status === 'rejected' && batchR.status === 'rejected') {
+    throw pricingR.reason instanceof Error ? pricingR.reason : new Error(String(pricingR.reason));
+  }
+  if (pricingR.status === 'fulfilled') {
+    const meta = batchR.status === 'fulfilled'
+      ? new Map(batchR.value.map((m) => [m.id, m]))
+      : new Map();
+    // 定价表为主，批量表补充上下文/输出等元数据与场景归属
+    for (const m of pricingR.value) {
+      const b = meta.get(m.id);
+      if (!b) continue;
+      if (b.maxInputTokens > m.maxInputTokens) m.maxInputTokens = b.maxInputTokens;
+      if (b.maxOutputTokens > m.maxOutputTokens) m.maxOutputTokens = b.maxOutputTokens;
+      if (b.vision) m.vision = true;
+      if (b.isDefault) m.isDefault = true;
+      // 场景归属仅在批量表给出「可对话」场景时才采信（批量表含大量非对话场景）
+      if (b.chatable && b.chatFunction) m.chatFunction = b.chatFunction;
+    }
+    return applyOverrides(pricingR.value);
+  }
+  // 定价表不可用：用批量表按「可对话场景 + 有显示名」过滤出可用列表
+  return applyOverrides(batchR.value.filter((m) => m.display_name && m.chatable));
+}
+
+/** 应用已知元数据修正（仅填充缺失值，不覆盖上游实测数据） */
+function applyOverrides(list) {
+  const overrides = require('./models').MODEL_OVERRIDES || {};
+  for (const m of list) {
+    const o = overrides[m.id];
+    if (!o) continue;
+    if (!m.maxInputTokens && o.maxInputTokens) m.maxInputTokens = o.maxInputTokens;
+    if (!m.maxOutputTokens && o.maxOutputTokens) m.maxOutputTokens = o.maxOutputTokens;
+    if (o.vision) m.vision = true;
+    if (o.reasoning) m.reasoning = true;
+  }
+  return list;
+}
+
+/** 批量场景表：batch_get_detail_param，按 config_name 合并各场景（仅作元数据源） */
+async function fetchBatchModels(acct) {
   const body = {
-    function: C.Function, config_names: null, need_prompt: false,
-    current_config_info: null, poly_prompt: true, mode_type: null, agent_type: null,
+    functions: C.ModelFunctions,
+    agent_type: '',
+    current_config_info: { config_name: '', is_custom_model: false },
   };
-  const r = await util.requestJson(C.AgentHost + C.EpModels, {
+  const r = await util.requestJson(C.AgentHost + C.EpModelsBatch, {
     method: 'POST', headers: SOLOHeaders(acct, { stream: false }), body, timeoutMs: 30000,
   });
-  const list = r.json && (r.json.config_info_list || (r.json.data && r.json.data.config_info_list));
-  if (!Array.isArray(list)) {
-    throw new Error('模型列表解析失败: ' + (r.json ? JSON.stringify(r.json).slice(0, 200) : r.body));
+  const scenes = r.json && (r.json.function_configs || (r.json.data && r.json.data.function_configs));
+  if (!Array.isArray(scenes)) {
+    throw new Error('批量模型列表解析失败: ' + (r.json ? JSON.stringify(r.json).slice(0, 200) : r.body));
   }
-  const seen = new Set();
-  const out = [];
-  for (const cfg of list) {
-    const name = String(cfg.config_name || '').trim();
-    if (!name || seen.has(name)) continue;
-    const disp = cfg.display_config || {};
-    if (disp.is_custom_model || name.startsWith('custom_model_')) continue; // 第三方代理模型需额外授权
-    seen.add(name);
-    // 元数据分两处：
-    //   context_window_tokens.dev     —— 上下文窗口（顶层）
-    //   model_detail_list[0]          —— max_tokens（输出上限）、prompt_max_tokens 等
-    //     （model_name 形如 'glm-5.3__dev'，dev 是计费通道标记，不带就是按 mode 分的通用值）
-    const detail = Array.isArray(cfg.model_detail_list) ? (cfg.model_detail_list[0] || {}) : {};
-    const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
-    out.push({
+  // name -> { meta, disp, display_name, scenes: Set }；跨场景合并取各项最大值
+  const merged = new Map();
+  const sceneRank = new Map(C.ModelFunctions.map((fn, i) => [fn, i]));
+  for (const scene of scenes) {
+    const fn = String(scene.function || '');
+    const list = scene.config_info_list;
+    if (!fn || !Array.isArray(list)) continue;
+    for (const cfg of list) {
+      const name = String(cfg.config_name || '').trim();
+      const disp = cfg.display_config || {};
+      if (!name || isCustomModel(name, disp)) continue;
+      const details = Array.isArray(cfg.model_detail_list) ? cfg.model_detail_list : [];
+      let out = 0;
+      for (const d of details) out = Math.max(out, num(d && d.max_tokens));
+      let item = merged.get(name);
+      if (!item) {
+        merged.set(name, {
+          meta: cfg, disp,
+          name,
+          display_name: String(disp.display_name || '').trim(),
+          ctx: maxContextWindow(cfg.context_window_tokens),
+          out,
+          scenes: new Set([fn]),
+        });
+        continue;
+      }
+      // 同一模型在多个场景各有一份配置：上下文/输出取最大，能力取并集
+      item.ctx = Math.max(item.ctx, maxContextWindow(cfg.context_window_tokens));
+      item.out = Math.max(item.out, out);
+      if (!item.display_name && disp.display_name) {
+        item.display_name = String(disp.display_name).trim();
+        item.disp = disp;
+        item.meta = cfg;
+      }
+      item.scenes.add(fn);
+    }
+  }
+  const prio = C.ChatFunctionPriority;
+  const chatableFns = C.PricingFunctions.split(',');
+  const pickFn = (scenesSet) => {
+    for (const fn of prio) if (scenesSet.has(fn)) return fn;
+    // 不在优先列表的场景，取场景表中序最小者（仍是对话可用场景）
+    return [...scenesSet].sort((a, b) => (sceneRank.get(a) ?? 99) - (sceneRank.get(b) ?? 99))[0] || '';
+  };
+  return [...merged.values()].map((item) => {
+    const { meta, disp, name, display_name, scenes, ctx, out } = item;
+    const chatFn = pickFn(scenes);
+    return {
       id: name,
-      name: disp.display_name || name,
-      maxInputTokens: num(cfg.context_window_tokens && cfg.context_window_tokens.dev),
-      maxOutputTokens: num(detail.max_tokens),
+      name: display_name || name,
+      display_name,                                        // 空名 = 内部工具模型（客户端选择器不展示）
+      maxInputTokens: ctx,
+      maxOutputTokens: out,
       tools: true,                      // SOLO 通道的模型均支持 function call
       vision: !!disp.multimodal,
       reasoning: String(disp.model_capability || '').includes('reasoning'),
-      isDefault: !!cfg.is_default,
-    });
+      isDefault: !!meta.is_default,
+      chatFunction: chatFn,
+      // 场景是否落在可对话范围内（fallback 列表与元数据覆写用；llm_utils_chat 按场景校验）
+      chatable: !!chatFn && chatableFns.includes(chatFn),
+    };
+  });
+}
+
+/** 定价表：/api/remote/v1/models（Web 端接口，仅 JWT + Web 头，无需设备指纹） */
+async function fetchPricingModels(acct) {
+  const at = (acct && acct.accessToken) || '';
+  const url = C.WorkHost + C.EpModelsPricing
+    + '?functions=' + encodeURIComponent(C.PricingFunctions) + '&show_custom_model=false';
+  const r = await util.requestJson(url, {
+    method: 'GET',
+    headers: {
+      'Accept': 'application/json',
+      'User-Agent': 'Mozilla/5.0',
+      'Referer': C.WorkHost + '/',
+      'Authorization': 'Cloud-IDE-JWT ' + at,
+      'X-Trae-Client-Type': 'web',
+      'X-Trae-User-Timezone': 'Asia/Shanghai',
+      'X-Preferenced-Language': 'zh-cn',
+    },
+    timeoutMs: 30000,
+  });
+  const d = r.json && (r.json.data || r.json);
+  const list = d && d.list;
+  if (!Array.isArray(list)) {
+    throw new Error('模型定价表解析失败: ' + (r.json ? JSON.stringify(r.json).slice(0, 200) : r.body));
   }
-  return out;
+  const prio = C.ChatFunctionPriority;
+  const merged = new Map(); // name -> { item, fnRank }
+  for (const group of list) {
+    const fn = String(group.function || '');
+    if (!fn || !Array.isArray(group.models)) continue;
+    const rank = prio.includes(fn) ? prio.indexOf(fn) : 99;
+    for (const m of group.models) {
+      const name = String(m.name || '').trim();
+      if (!name || isCustomModel(name, {})) continue;
+      let feat = {};
+      try { feat = typeof m.features === 'string' ? JSON.parse(m.features) : (m.features || {}); } catch { /* 忽略 */ }
+      const prev = merged.get(name);
+      if (prev && prev.fnRank <= rank) continue;
+      merged.set(name, {
+        fnRank: rank,
+        item: {
+          id: name,
+          name: m.display_name || name,
+          maxInputTokens: 0, // 定价表无上下文元数据，留 0（/v1/models 不输出）
+          maxOutputTokens: 0,
+          tools: true,
+          vision: !!(feat.multimodal && feat.multimodal.enable),
+          reasoning: !!(feat.reasoning && feat.reasoning.enable),
+          isDefault: false,
+          chatFunction: fn,
+        },
+      });
+    }
+  }
+  return [...merged.values()].map((v) => v.item);
 }
 
 /** 签到状态：{ checkedIn, credits, enable } */

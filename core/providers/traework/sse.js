@@ -134,13 +134,17 @@ function createSseConverter() {
         state.pendingUsage = ev.usage;
         break;
       case 'done':
+        // 上游 error 事件后常跟 done，避免重复收尾（[DONE] 之后不应再有帧）
+        if (state.sawDone) break;
         out += chunkText(state, {}, ev.finishReason || 'stop');
         out += 'data: [DONE]\n\n';
         state.sawDone = true;
         break;
       case 'error': {
-        const msg = `trae upstream error code=${ev.errorCode} msg=${ev.errorMessage}`;
-        out += chunkText(state, { content: msg }, 'stop');
+        // 以 OpenAI 错误对象透传（不再伪装成正文，避免客户端把失败当正常回复）。
+        // 正文已流出时补收尾帧让流干净终止；否则直接错误 + [DONE]，SDK 会抛错。
+        out += 'data: ' + JSON.stringify(buildUpstreamError(ev.errorCode, ev.errorMessage)) + '\n\n';
+        if (state.sawContent) out += chunkText(state, {}, 'stop');
         out += 'data: [DONE]\n\n';
         state.sawDone = true;
         break;
@@ -265,7 +269,8 @@ function aggregate(sseText) {
   if (eventName) flush();
 
   if (upstreamError) {
-    const err = new Error(`trae upstream error code=${upstreamError.code} msg=${upstreamError.message}`);
+    const built = buildUpstreamError(upstreamError.code, upstreamError.message);
+    const err = new Error(built.error.message);
     err.upstreamCode = upstreamError.code;
     throw err;
   }
@@ -307,6 +312,19 @@ function mergeToolCalls(store, list) {
       }
     }
   }
+}
+
+/**
+ * 上游 error 事件 -> OpenAI 错误对象。
+ * 4001（参数校验失败）在新上架模型（glm-5.3 系列）上表现为「列表可见但对话通道
+ * 未开放」，附提示避免用户误以为是代理故障。
+ */
+function buildUpstreamError(code, message) {
+  let msg = `Trae upstream error code=${code} msg=${message}`;
+  if (code === 4001) {
+    msg += ' —— 上游拒绝了该模型。若为新上架模型（如 glm-5.3 系列），说明其对话通道尚未对开放接口生效，请先切换其他模型，待上游放开后自动可用';
+  }
+  return { error: { message: msg, type: 'upstream_error', code: code || null, param: null } };
 }
 
 module.exports = { createSseConverter, aggregate, parseSOLOEvent, normalizeToolCalls };
