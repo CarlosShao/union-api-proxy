@@ -69,6 +69,7 @@ async function pickHeaders(accountId) {
   } else {
     acct = await auth.getValidSession();
   }
+  // 渠道分派：Trae 走自己的 ug 接口（由 providers/traework 处理），此处仅构造 CodeBuddy 头
   const headers = Object.assign({}, auth.buildAuthHeaders(acct), {
     Accept: 'application/json',
     'X-Product': 'WorkBuddy',
@@ -78,6 +79,11 @@ async function pickHeaders(accountId) {
     'User-Agent': 'WorkBuddy/' + WORKBUDDY_CLIENT_VERSION,
   });
   return { headers, account: acct };
+}
+
+/** 取账号所属渠道（缺省 codebuddy） */
+function providerOf(acct) {
+  return (acct && acct.provider) || 'codebuddy';
 }
 
 function accountLabel(acct) {
@@ -90,6 +96,25 @@ function accountLabel(acct) {
  * @returns {Promise<object>} { ok, code, msg, data, account, accountId }
  */
 async function checkinStatus(accountId) {
+  // 非默认渠道：交给 channel provider 的实现（如 Trae 的 ug 接口）
+  const pre = accountId ? sessionMod.getAccount(accountId) : null;
+  if (pre && providerOf(pre) !== 'codebuddy') {
+    const provider = require('./providers/all').getProvider(providerOf(pre));
+    if (provider && typeof provider.checkinStatus === 'function') {
+      try {
+        const acct = await auth.getValidAccount(pre);
+        const st = await provider.checkinStatus(acct.id, acct);
+        return {
+          ok: true, data: { checkedIn: !!st.checkedIn, credits: st.credits || 0, enable: st.enable !== false },
+          account: accountLabel(acct), accountId: acct.id,
+        };
+      } catch (e) {
+        return { ok: false, error: e.message, account: accountLabel(pre), accountId: pre.id };
+      }
+    }
+    return { ok: false, error: '该渠道不支持签到状态查询', account: accountLabel(pre), accountId: pre.id };
+  }
+
   const { headers, account } = await pickHeaders(accountId);
   const r = await util.requestJson(checkinUrl('checkin-activity-status'), {
     method: 'POST', headers, body: {}, timeoutMs: 20000,
@@ -109,6 +134,30 @@ async function checkinStatus(accountId) {
  * @returns {Promise<object>} { ok, code, msg, data, alreadyCheckedIn, account, accountId }
  */
 async function dailyCheckin(accountId) {
+  // 非默认渠道：交给 channel provider 的实现
+  const pre = accountId ? sessionMod.getAccount(accountId) : null;
+  if (pre && providerOf(pre) !== 'codebuddy') {
+    const provider = require('./providers/all').getProvider(providerOf(pre));
+    if (provider && typeof provider.checkin === 'function') {
+      try {
+        const acct = await auth.getValidAccount(pre);
+        const r = await provider.checkin(acct.id, acct);
+        logger.log('info', 'auth', `[${provider.label}] 每日签到成功${r.already ? '（已签到）' : ''} - ${accountLabel(acct)}`);
+        return { ok: true, alreadyCheckedIn: !!r.already, credits: r.credits || 0, account: accountLabel(acct), accountId: acct.id };
+      } catch (e) {
+        // 上游的「已签到」是正常态，不记为失败
+        const msg = e.message || '';
+        if (/已签到|already/i.test(msg)) {
+          logger.log('info', 'auth', `[${provider.label}] 今日已签到 - ${accountLabel(pre)}`);
+          return { ok: true, alreadyCheckedIn: true, account: accountLabel(pre), accountId: pre.id };
+        }
+        logger.log('warn', 'auth', `[${provider.label}] 签到失败: ${msg}`);
+        return { ok: false, error: msg, account: accountLabel(pre), accountId: pre.id };
+      }
+    }
+    return { ok: false, error: '该渠道不支持签到', account: accountLabel(pre), accountId: pre.id };
+  }
+
   const { headers, account } = await pickHeaders(accountId);
   const r = await util.requestJson(checkinUrl('daily-checkin'), {
     method: 'POST', headers, body: {}, timeoutMs: 20000,

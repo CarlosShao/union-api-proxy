@@ -17,6 +17,7 @@ const vscode = require('./vscode');
 const auth = require('./auth');
 const openai = require('./openai');
 const responses = require('./responses');
+const providers = require('./providers/all');
 const checkin = require('./checkin');
 const checkinScheduler = require('./checkinScheduler');
 const credits = require('./credits');
@@ -28,8 +29,10 @@ function accountPublic(acct) {
   if (!acct) return null;
   const a = acct.account || {};
   const au = acct.auth || {};
+  const provider = acct.provider || 'codebuddy';
   return {
     id: acct.id,
+    provider,
     name: acct.name || '',
     source: acct.source || 'file',
     addedBy: acct.addedBy || acct.source || 'file',
@@ -37,7 +40,7 @@ function accountPublic(acct) {
     nickname: a.nickname || '',
     type: a.type || 'personal',
     enterpriseId: a.enterpriseId || '',
-    domain: au.domain || config.ENDPOINT_HOST,
+    domain: au.domain || (provider === 'traework' ? 'trae.cn' : config.ENDPOINT_HOST),
     expiresAt: au.expiresAt || 0,
     expiresInSeconds: au.expiresAt ? Math.round((au.expiresAt - Date.now()) / 1000) : 0,
     hasToken: !!au.accessToken,
@@ -49,16 +52,29 @@ function accountPublic(acct) {
 }
 
 function statusObject() {
-  const pool = sessionMod.getPoolConfig();
+  const kinds = providers.providerKinds();
   const active = sessionMod.getActiveAccount();
   const a = active ? active.account : null;
+  // 逐渠道的池配置与账号数，供管理页分渠道展示
+  const pools = {};
+  const accountCounts = sessionMod.accountCountsByProvider();
+  for (const k of kinds) {
+    pools[k] = Object.assign({}, sessionMod.getPoolConfig(k));
+    pools[k].accountCount = accountCounts[k] || 0;
+    pools[k].loggedIn = sessionMod.isLoggedIn(k);
+    pools[k].label = providers.labelOf(k);
+  }
+  const defaultKind = providers.defaultKind();
   return {
     loggedIn: sessionMod.isLoggedIn(),
     source: sessionMod.getSessionSource(),
     endpoint: config.ENDPOINT,
     baseUrl: `http://${config.HOST}:${config.PORT}`,
     openaiBaseUrl: `http://${config.HOST}:${config.PORT}/v1`,
-    pool: Object.assign({}, pool),
+    // 兼容旧字段：默认渠道的池信息
+    pool: Object.assign({}, sessionMod.getPoolConfig(defaultKind)),
+    pools,
+    providers: kinds.map((k) => ({ kind: k, label: providers.labelOf(k) })),
     accounts: sessionMod.listAccounts().map(accountPublic),
     account: a ? { uid: a.uid, nickname: a.nickname, type: a.type, enterpriseId: a.enterpriseId || '' } : null,
     auth: active ? {
@@ -68,24 +84,54 @@ function statusObject() {
       expiresAt: active.auth.expiresAt || 0,
       expiresInSeconds: active.auth.expiresAt ? Math.round((active.auth.expiresAt - Date.now()) / 1000) : 0,
     } : null,
-    models: models.allModels(store.listModels(), store.getHiddenModels()),
+    models: models.allModels(store.listModels(), store.getHiddenModels(), providers.staticModelsByProvider()),
   };
 }
 
 /* ============================ 系统配置 ============================ */
 
-function accountsPayload() {
-  const pool = sessionMod.getPoolConfig();
+function accountsPayload(provider) {
+  const kinds = providers.providerKinds();
+  const pools = {};
+  const accountCounts = sessionMod.accountCountsByProvider();
+  for (const k of kinds) {
+    pools[k] = Object.assign({}, sessionMod.getPoolConfig(k));
+    pools[k].accountCount = accountCounts[k] || 0;
+    pools[k].loggedIn = sessionMod.isLoggedIn(k);
+    pools[k].label = providers.labelOf(k);
+  }
   const states = store.listCheckinStates();
   const autoCheckin = store.autoCheckinEnabled();
-  const accounts = sessionMod.listAccounts().map(function (acct) {
+  const accounts = sessionMod.listAccounts(provider).map(function (acct) {
     const pub = accountPublic(acct);
     const st = states[acct.id];
     pub.checkinLastDate = st ? st.lastDate : '';
     pub.checkinNextAt = st ? st.nextAt : 0;
     return pub;
   });
-  return { pool, accounts, autoCheckin };
+  const defaultKind = providers.defaultKind();
+  return {
+    pool: pools[defaultKind],
+    pools,
+    providers: kinds.map((k) => ({ kind: k, label: providers.labelOf(k) })),
+    accounts,
+    autoCheckin,
+  };
+}
+
+/**
+ * /v1/models 的响应：只列出「已有账号的渠道」的模型。
+ * 未登录任何账号的渠道不应出现（避免客户端选到用不了的模型）；默认渠道始终保留，保持旧客户端行为不变。
+ */
+function modelsResponseForLoggedInProviders() {
+  const defaultKind = providers.defaultKind();
+  const allStatic = providers.staticModelsByProvider();
+  const extra = {};
+  for (const [kind, list] of Object.entries(allStatic)) {
+    if (kind === defaultKind) continue;
+    if (sessionMod.isLoggedIn(kind)) extra[kind] = list;
+  }
+  return models.modelsResponse(store.listModels(), store.getHiddenModels(), extra);
 }
 
 function parseBoolFlag(v) {
@@ -109,7 +155,7 @@ function configResponse() {
     options: {
       levels: config.LOG_LEVELS,
       categories: config.LOG_CATEGORIES,
-      models: models.allModels(store.listModels(), store.getHiddenModels()).map((m) => ({ id: m.id, name: m.name, hidden: !!m.hidden })),
+      models: models.allModels(store.listModels(), store.getHiddenModels(), providers.staticModelsByProvider()).map((m) => ({ id: models.modelKey(m), name: m.name, hidden: !!m.hidden, provider: m.provider || "codebuddy" })),
     },
   };
 }
@@ -469,7 +515,8 @@ async function route(req, res) {
 
   /* ---- 账号池管理 ---- */
   if (pathname === '/api/accounts' && method === 'GET') {
-    util.sendJson(res, 200, accountsPayload());
+    // 可选 ?provider=traework 只看某渠道；缺省返回全部渠道
+    util.sendJson(res, 200, accountsPayload(u.searchParams.get('provider') || undefined));
     return;
   }
 
@@ -503,10 +550,22 @@ async function route(req, res) {
       const buf = await util.readBody(req);
       const body = buf.length ? JSON.parse(buf.toString('utf8')) : {};
       const name = (body && typeof body.name === 'string') ? body.name.trim() : '';
+      // channel 指定走哪个渠道的登录流程；缺省 = 默认渠道（CodeBuddy，保持旧行为）
+      const kind = (body && typeof body.channel === 'string' && body.channel.trim()) ? body.channel.trim() : providers.defaultKind();
+      const provider = providers.getProvider(kind);
+      if (!provider) { util.sendJson(res, 400, { error: { message: `未知渠道: ${kind}` } }); return; }
+
+      // Trae 等渠道自带 login 编排（PKCE + 本地随机端口回调）
+      if (provider.login && typeof provider.login.start === 'function') {
+        const { state, authUrl } = await provider.login.start();
+        util.sendJson(res, 200, { state, authUrl, name, channel: kind });
+        return;
+      }
+
       const data = await auth.fetchAuthState();
-      auth.pendingLogins.set(data.state, { status: 'pending', startedAt: Date.now(), name });
+      auth.pendingLogins.set(data.state, { status: 'pending', startedAt: Date.now(), name, channel: kind });
       auth.completeLogin(data.state, name);
-      util.sendJson(res, 200, { state: data.state, authUrl: data.authUrl, name });
+      util.sendJson(res, 200, { state: data.state, authUrl: data.authUrl, name, channel: kind });
     } catch (e) { util.sendJson(res, 502, { error: e.message }); }
     return;
   }
@@ -514,12 +573,45 @@ async function route(req, res) {
   if (pathname === '/api/accounts/login/status' && method === 'GET') {
     const state = u.searchParams.get('state');
     if (!state) { util.sendJson(res, 400, { error: '缺少 state 参数' }); return; }
+    // 先查渠道自带的登录编排（如 Trae 的 PKCE 流程会自己持有 pending 表）
+    for (const provider of providers.listProviders()) {
+      if (!provider.login || typeof provider.login.status !== 'function') continue;
+      const st = provider.login.status(state);
+      if (st && st.status !== 'unknown') {
+        if (st.status === 'success') {
+          // 登录成功后把账号写入账号池
+          const acct = sessionMod.addAccount(st.account);
+          if (!acct) { util.sendJson(res, 200, { status: 'error', error: '账号写入失败' }); return; }
+          logger.log('info', 'auth', `[${provider.label}] 账号已加入账号池: ${acct.name || (acct.account && acct.account.uid)}`);
+          util.sendJson(res, 200, { status: 'success', accountId: acct.id, account: accountPublic(acct) });
+          return;
+        }
+        util.sendJson(res, 200, { status: st.status, error: st.error });
+        return;
+      }
+    }
     const entry = auth.pendingLogins.get(state);
     if (!entry) { util.sendJson(res, 404, { error: '未知 state' }); return; }
     if (entry.status === 'success') { util.sendJson(res, 200, { status: 'success', accountId: entry.accountId, account: entry.account }); auth.pendingLogins.delete(state); return; }
     if (entry.status === 'error') { util.sendJson(res, 200, { status: 'error', error: entry.error }); auth.pendingLogins.delete(state); return; }
     if (Date.now() - entry.startedAt > config.LOGIN_TIMEOUT_MS) { entry.status = 'timeout'; util.sendJson(res, 200, { status: 'timeout', error: '登录超时' }); auth.pendingLogins.delete(state); return; }
     util.sendJson(res, 200, { status: 'pending' });
+    return;
+  }
+
+  if (pathname === '/api/accounts/login/cancel' && method === 'POST') {
+    try {
+      const buf = await util.readBody(req);
+      const body = buf.length ? JSON.parse(buf.toString('utf8')) : {};
+      const state = (body && typeof body.state === 'string') ? body.state : '';
+      if (state) {
+        for (const provider of providers.listProviders()) {
+          if (provider.login && typeof provider.login.cancel === 'function') provider.login.cancel(state);
+        }
+        auth.pendingLogins.delete(state);
+      }
+      util.sendJson(res, 200, { ok: true });
+    } catch (e) { util.sendJson(res, 400, { error: { message: e.message } }); }
     return;
   }
 
@@ -540,7 +632,12 @@ async function route(req, res) {
   }
 
   if (pathname === '/api/pool' && method === 'GET') {
-    util.sendJson(res, 200, sessionMod.getPoolConfig());
+    // 不传 provider 时返回全部渠道的池配置（管理页按渠道分别展示）
+    const kind = u.searchParams.get('provider');
+    if (kind) { util.sendJson(res, 200, sessionMod.getPoolConfig(kind)); return; }
+    const all = {};
+    for (const k of providers.providerKinds()) all[k] = sessionMod.getPoolConfig(k);
+    util.sendJson(res, 200, all);
     return;
   }
   if (pathname === '/api/pool' && method === 'PUT') {
@@ -551,8 +648,9 @@ async function route(req, res) {
       if (body.mode === 'pool' || body.mode === 'pinned') patch.mode = body.mode;
       if (typeof body.strategy === 'string' && body.strategy) patch.strategy = body.strategy;
       if (body.pinnedId !== undefined) patch.pinnedId = body.pinnedId || null;
-      const pool = sessionMod.setPoolConfig(patch);
-      logger.log('info', 'config', '账号池配置已更新', pool);
+      const kind = (typeof body.provider === 'string' && body.provider.trim()) ? body.provider.trim() : undefined;
+      const pool = sessionMod.setPoolConfig(patch, kind);
+      logger.log('info', 'config', `账号池配置已更新（${kind || '默认渠道'}）`, pool);
       util.sendJson(res, 200, pool);
     } catch (e) {
       util.sendJson(res, 400, { error: { message: '更新失败: ' + e.message } });
@@ -638,7 +736,7 @@ async function route(req, res) {
   if (pathname === '/v1/models') {
     const keyCheck = auth.verifyClientKey(req);
     if (!keyCheck.ok) { util.sendJson(res, keyCheck.rateLimited ? 429 : 401, { error: { message: keyCheck.message, type: 'authentication_error' } }); return; }
-    util.sendJson(res, 200, models.modelsResponse(store.listModels(), store.getHiddenModels()));
+    util.sendJson(res, 200, modelsResponseForLoggedInProviders());
     return;
   }
   if (pathname === '/models' && method === 'GET') {
@@ -646,13 +744,13 @@ async function route(req, res) {
     if (accept.includes('text/html')) { serveIndex(res); return; }
     const keyCheck = auth.verifyClientKey(req);
     if (!keyCheck.ok) { util.sendJson(res, keyCheck.rateLimited ? 429 : 401, { error: { message: keyCheck.message, type: 'authentication_error' } }); return; }
-    util.sendJson(res, 200, models.modelsResponse(store.listModels(), store.getHiddenModels()));
+    util.sendJson(res, 200, models.modelsResponse(store.listModels(), store.getHiddenModels(), providers.staticModelsByProvider()));
     return;
   }
 
   /* ---- 自定义模型管理 API ---- */
   if (pathname === '/api/models' && method === 'GET') {
-    util.sendJson(res, 200, { models: models.allModels(store.listModels(), store.getHiddenModels()) });
+    util.sendJson(res, 200, { models: models.allModels(store.listModels(), store.getHiddenModels(), providers.staticModelsByProvider()) });
     return;
   }
   if (pathname === '/api/models' && method === 'POST') {
@@ -669,12 +767,15 @@ async function route(req, res) {
     return;
   }
   if (pathname.startsWith('/api/models/') && method === 'DELETE') {
-    const id = decodeURIComponent(pathname.slice('/api/models/'.length));
-    const r = store.removeModel(id);
+    // 对外 id 可能带渠道前缀（traework/xxx），拆出 provider 精确定位
+    const rawId = decodeURIComponent(pathname.slice('/api/models/'.length));
+    const { kind, model } = providers.resolveModel(rawId);
+    const hasPrefix = rawId !== model;
+    const r = store.removeModel(model, hasPrefix ? kind : undefined);
     if (r.error) { util.sendJson(res, 400, { error: { message: r.error } }); return; }
     if (!r.deleted) { util.sendJson(res, 404, { error: { message: '未找到该模型' } }); return; }
-    logger.log('info', 'config', `删除自定义模型: ${id}`);
-    util.sendJson(res, 200, { ok: true, id });
+    logger.log('info', 'config', `删除自定义模型: ${rawId}`);
+    util.sendJson(res, 200, { ok: true, id: rawId });
     return;
   }
   if (pathname.startsWith('/api/models/') && method === 'PUT' && pathname.endsWith('/hidden')) {

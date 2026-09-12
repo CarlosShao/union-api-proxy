@@ -14,6 +14,7 @@ const util = require('./util');
 const auth = require('./auth');
 const openai = require('./openai');
 const sanitize = require('./sanitize');
+const providers = require('./providers/all');
 
 // CodeBuddy 后端的内容过滤器会拦截含 "Codex"/"OpenAI" 等竞品品牌词的系统提示词，
 // 返回 11128 "Illegal API invocation from an unapproved channel"。净化规则统一在 core/sanitize.js。
@@ -53,16 +54,23 @@ function convertToolChoice(tc) {
   return 'auto';
 }
 
-/** Responses API 请求 → chat/completions 请求 */
-function responsesToChatInput(p) {
+/**
+ * Responses API 请求 → chat/completions 请求。
+ * opts.sanitize：是否做竞品词净化。仅 CodeBuddy 需要（11128 拦截是其独有机制），
+ * 其它渠道必须关闭 —— 盲目替换会改坏用户内容。
+ */
+function responsesToChatInput(p, opts) {
+  const doSanitize = !opts || opts.sanitize !== false;
+  const sysText = (s) => (doSanitize ? sanitize.sanitizeText(s) : s);
+  const phraseText = (s) => (doSanitize ? sanitize.sanitizePhrase(s) : s);
   const cfg = store.getConfig();
   const chat = { model: (p.model && p.model !== '') ? p.model : (cfg.defaultModel || 'default'), messages: [], stream: !!p.stream };
 
-  if (p.instructions) chat.messages.push({ role: 'system', content: sanitize.sanitizeText(p.instructions) });
+  if (p.instructions) chat.messages.push({ role: 'system', content: sysText(p.instructions) });
 
   const input = p.input;
   if (typeof input === 'string') {
-    chat.messages.push({ role: 'user', content: sanitize.sanitizePhrase(input) });
+    chat.messages.push({ role: 'user', content: phraseText(input) });
   } else if (Array.isArray(input)) {
     let pendingToolCalls = [];
     const flushToolCalls = () => {
@@ -72,7 +80,7 @@ function responsesToChatInput(p) {
       }
     };
     for (const item of input) {
-      if (typeof item === 'string') { flushToolCalls(); chat.messages.push({ role: 'user', content: sanitize.sanitizePhrase(item) }); continue; }
+      if (typeof item === 'string') { flushToolCalls(); chat.messages.push({ role: 'user', content: phraseText(item) }); continue; }
       if (!item || typeof item !== 'object') continue;
 
       if (item.role && item.content !== undefined) {
@@ -80,7 +88,7 @@ function responsesToChatInput(p) {
         const isSys = item.role === 'developer' || item.role === 'system';
         const role = item.role === 'developer' ? 'system' : item.role;
         const text = contentToText(item.content);
-        chat.messages.push({ role, content: isSys ? sanitize.sanitizeText(text) : sanitize.sanitizePhrase(text) });
+        chat.messages.push({ role, content: isSys ? sysText(text) : phraseText(text) });
         continue;
       }
       if (item.type === 'message') {
@@ -88,7 +96,7 @@ function responsesToChatInput(p) {
         const isSys = item.role === 'developer' || item.role === 'system';
         const role = item.role === 'developer' ? 'system' : (item.role || 'user');
         const text = contentToText(item.content);
-        chat.messages.push({ role, content: isSys ? sanitize.sanitizeText(text) : sanitize.sanitizePhrase(text) });
+        chat.messages.push({ role, content: isSys ? sysText(text) : phraseText(text) });
       } else if (item.type === 'function_call') {
         pendingToolCalls.push({
           id: item.call_id || item.id || util.genId('call'),
@@ -97,7 +105,7 @@ function responsesToChatInput(p) {
         });
       } else if (item.type === 'function_call_output') {
         flushToolCalls();
-        chat.messages.push({ role: 'tool', tool_call_id: item.call_id || '', content: sanitize.sanitizePhrase(contentToText(item.output)) });
+        chat.messages.push({ role: 'tool', tool_call_id: item.call_id || '', content: phraseText(contentToText(item.output)) });
       }
     }
     flushToolCalls();
@@ -110,7 +118,7 @@ function responsesToChatInput(p) {
         type: 'function',
         function: {
           name: t.name,
-          description: sanitize.sanitizeText(t.description || ''),
+          description: sysText(t.description || ''),
           parameters: t.parameters || t.input_schema || { type: 'object', properties: {} },
         },
       }));
@@ -204,8 +212,12 @@ function chatCompletionToResponse(completion, req) {
   };
 }
 
-/** 把 CodeBuddy 的 chat SSE 流转成 Responses API SSE 事件（边收边写） */
-function streamChatToResponses(clientRes, urlStr, headers, body, originalReq) {
+/**
+ * 把上游 chat SSE 流转成 Responses API SSE 事件（边收边写）。
+ * converter：可选的渠道专属「上游流 -> OpenAI SSE」转换器（如 Trae 的 SOLO 事件流）。
+ *   提供时，上游字节先喂给 feed()，产出的 OpenAI SSE 文本再解析成 Responses 事件。
+ */
+function streamChatToResponses(clientRes, urlStr, headers, body, originalReq, converter) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlStr);
     const mod = u.protocol === 'https:' ? https : http;
@@ -301,9 +313,42 @@ function streamChatToResponses(clientRes, urlStr, headers, body, originalReq) {
       clientRes.end();
     };
 
+    /** 从一段 OpenAI SSE 文本里逐个解析 data 块并回调（两种上游路径共用） */
+    const consumeSseText = (text) => {
+      for (const line of text.split('\n')) {
+        const t = line.trim();
+        if (!t.startsWith('data:')) continue;
+        const data = t.slice(5).trim();
+        if (!data || data === '[DONE]') continue;
+        try { onChunk(JSON.parse(data)); } catch { /* skip */ }
+      }
+    };
+
     const req = mod.request(u, { method: 'POST', headers, agent: util.agentFor(u.protocol) }, (upRes) => {
       const ct = (upRes.headers['content-type'] || '');
-      if (!ct.includes('text/event-stream')) {
+      const upstreamOk = upRes.statusCode >= 200 && upRes.statusCode < 300;
+      // 上游报错一律原样透传（含状态码），不要尝试解析成 Responses 事件
+      if (!upstreamOk) {
+        let errBody = '';
+        upRes.setEncoding('utf8');
+        upRes.on('data', (c) => { errBody += c; });
+        upRes.on('end', () => {
+          logger.log('error', 'responses', `上游非 2xx 响应 ${upRes.statusCode}: ${errBody.slice(0, 500)}`);
+          if (!clientRes.headersSent) {
+            clientRes.writeHead(upRes.statusCode || 502, { 'Content-Type': ct || 'application/json', 'Access-Control-Allow-Origin': '*' });
+            clientRes.end(errBody);
+          } else {
+            const ev = { type: 'response.failed', sequence_number: state.seq++, response: { id: state.responseId, object: 'response', status: 'failed', error: { code: 'upstream_error', message: `上游返回 ${upRes.statusCode}: ${errBody.slice(0, 300)}` } } };
+            clientRes.write(`event: response.failed\ndata: ${JSON.stringify(ev)}\n\n`);
+            clientRes.end();
+          }
+          resolve({ usage: state.usage, model: state.model, status: 'error' });
+        });
+        upRes.on('error', reject);
+        return;
+      }
+      // 非转换器模式下，上游必须返回 SSE 才可解析
+      if (!converter && !ct.includes('text/event-stream')) {
         let errBody = '';
         upRes.setEncoding('utf8');
         upRes.on('data', (c) => { errBody += c; });
@@ -322,6 +367,25 @@ function streamChatToResponses(clientRes, urlStr, headers, body, originalReq) {
         upRes.on('error', reject);
         return;
       }
+
+      if (converter) {
+        // 上游为自定义事件流：整段喂给转换器，产出 OpenAI SSE 后再解析
+        upRes.setEncoding('utf8');
+        upRes.on('data', (chunk) => {
+          try { consumeSseText(converter.feed(chunk)); } catch { /* 转换异常不中断流 */ }
+        });
+        upRes.on('end', () => {
+          try { consumeSseText(converter.end()); } catch { /* ignore */ }
+          if (!state.usage && typeof converter.getUsage === 'function') {
+            try { state.usage = converter.getUsage(); } catch { /* ignore */ }
+          }
+          finish();
+          resolve({ usage: state.usage, model: state.model, status: upRes.statusCode === 200 ? 'ok' : 'error' });
+        });
+        upRes.on('error', reject);
+        return;
+      }
+
       let buf = '';
       upRes.setEncoding('utf8');
       upRes.on('data', (chunk) => {
@@ -330,25 +394,11 @@ function streamChatToResponses(clientRes, urlStr, headers, body, originalReq) {
         while ((idx = buf.indexOf('\n\n')) !== -1) {
           const block = buf.slice(0, idx);
           buf = buf.slice(idx + 2);
-          for (const line of block.split('\n')) {
-            const t = line.trim();
-            if (!t.startsWith('data:')) continue;
-            const data = t.slice(5).trim();
-            if (!data || data === '[DONE]') continue;
-            try { onChunk(JSON.parse(data)); } catch { /* skip */ }
-          }
+          consumeSseText(block);
         }
       });
       upRes.on('end', () => {
-        if (buf.trim()) {
-          for (const line of buf.split('\n')) {
-            const t = line.trim();
-            if (!t.startsWith('data:')) continue;
-            const data = t.slice(5).trim();
-            if (!data || data === '[DONE]') continue;
-            try { onChunk(JSON.parse(data)); } catch { /* skip */ }
-          }
-        }
+        if (buf.trim()) consumeSseText(buf);
         finish();
         resolve({ usage: state.usage, model: state.model, status: upRes.statusCode === 200 ? 'ok' : 'error' });
       });
@@ -383,13 +433,24 @@ async function handleResponses(req, res) {
   if (body.length) { try { payload = JSON.parse(body.toString('utf8')); } catch { payload = null; } }
   if (payload == null) payload = {};
 
-  const chatPayload = responsesToChatInput(payload);
   const cfg = store.getConfig();
-  if (cfg.forceModel) chatPayload.model = cfg.forceModel;
-  chatPayload.stream = true; // CodeBuddy 只支持流式
+  // 先解析渠道：净化策略与请求体改写都取决于渠道
+  const reqModel = cfg.forceModel || payload.model || cfg.defaultModel || 'default';
+  const resolved = providers.resolveModel(reqModel);
+  const provider = providers.getProvider(resolved.kind);
+  if (!provider) {
+    util.sendJson(res, 400, { error: { message: `未知渠道: ${resolved.kind}`, type: 'invalid_request_error' } });
+    return;
+  }
+
+  // 净化仅对 CodeBuddy 生效（11128 竞品词拦截是其独有机制）
+  const chatPayload = responsesToChatInput(payload, { sanitize: resolved.kind === 'codebuddy' });
+  chatPayload.model = resolved.model;
+  chatPayload.stream = true; // 上游仅支持流式（Trae 同样如此）
+  if (typeof provider.preparePayload === 'function') provider.preparePayload(chatPayload);
 
   const timeoutMs = store.getRequestTimeoutMs();
-  logger.log('info', 'responses', `model=${payload.model || chatPayload.model} stream=${!!payload.stream} messages=${chatPayload.messages.length}`, logger.requestSummary(payload, { messages: chatPayload.messages.length }));
+  logger.log('info', 'responses', `model=${payload.model || chatPayload.model} provider=${resolved.kind} stream=${!!payload.stream} messages=${chatPayload.messages.length}`, logger.requestSummary(payload, { messages: chatPayload.messages.length }));
 
   if (process.env.CODEBUDDY_DEBUG) {
     try {
@@ -400,7 +461,7 @@ async function handleResponses(req, res) {
 
   const accountKey = auth.extractAccountKey(req, payload);
   let acct;
-  try { acct = await auth.pickAccountForRequest(accountKey, keyCheck.accountId || ''); }
+  try { acct = await auth.pickAccountForRequest(accountKey, keyCheck.accountId || '', resolved.kind); }
   catch (e) {
     logger.log('warn', 'responses', `拒绝: ${e.message}`);
     util.sendJson(res, 401, { error: { message: e.message, type: 'authentication_error' } });
@@ -429,22 +490,26 @@ async function handleResponses(req, res) {
     });
   };
 
-  const headers = { ...auth.buildChatRequestHeaders(acct), 'Content-Type': 'application/json', 'Accept': 'application/json' };
-  const targetUrl = `${config.ENDPOINT}/v2/chat/completions`;
+  // 按渠道取请求头与上行地址（Trae 用 Cloud-IDE-JWT + 设备指纹，CodeBuddy 用 CLI 身份头）
+  const headers = { ...provider.buildChatHeaders(acct), 'Content-Type': 'application/json' };
+  if (resolved.kind === 'codebuddy') headers['Accept'] = 'application/json';
+  const targetUrl = provider.chatUrl(acct);
   const jsonBody = JSON.stringify(chatPayload);
   const startedAt = Date.now();
+  const converter = typeof provider.createSseConverter === 'function' ? provider.createSseConverter() : null;
 
   try {
     if (payload.stream) {
       res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*', 'X-Accel-Buffering': 'no' });
-      const done = await streamChatToResponses(res, targetUrl, headers, jsonBody, payload);
+      const done = await streamChatToResponses(res, targetUrl, headers, jsonBody, payload, converter);
       logger.log('info', 'responses', `流式结束 (${Date.now() - startedAt}ms)`, logger.requestSummary(payload, { stream: true, durationMs: Date.now() - startedAt }));
       record(done && done.usage, (done && done.status) || 'ok');
     } else {
       const r = await util.requestRaw(targetUrl, { method: 'POST', headers, body: jsonBody, timeoutMs });
       const ct = (r.headers && r.headers['content-type']) || '';
-      if (ct.includes('text/event-stream') || r.body.includes('chat.completion.chunk')) {
-        const completion = openai.aggregateSseToCompletion(r.body);
+      if (ct.includes('text/event-stream') || r.body.includes('chat.completion.chunk') || resolved.kind !== 'codebuddy') {
+        const completion = typeof provider.aggregate === 'function'
+          ? provider.aggregate(r.body) : openai.aggregateSseToCompletion(r.body);
         logger.log('info', 'responses', `完成 (${Date.now() - startedAt}ms)`, logger.requestSummary(payload, { stream: false, durationMs: Date.now() - startedAt, tokens: completion.usage && completion.usage.total_tokens }));
         record(completion.usage, 'ok');
         util.sendJson(res, 200, chatCompletionToResponse(completion, payload));

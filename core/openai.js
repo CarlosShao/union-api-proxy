@@ -9,7 +9,7 @@ const store = require('./store');
 const logger = require('./logger');
 const util = require('./util');
 const auth = require('./auth');
-const sanitize = require('./sanitize');
+const providers = require('./providers/all');
 
 const UPSTREAM_MAP = {
   '/v1/chat/completions': '/v2/chat/completions',
@@ -19,6 +19,9 @@ const UPSTREAM_MAP = {
   '/v2/completions': '/v2/completions',
   '/v2/embeddings': '/v2/embeddings',
 };
+
+// 仅 CodeBuddy 有这两个端点（Trae SOLO 通道只提供 chat）
+const CHAT_PATHS = new Set(['/v1/chat/completions', '/v2/chat/completions']);
 
 /** 把 CodeBuddy 的 SSE 流聚合成一个 OpenAI 非流式 chat.completion 响应 */
 function aggregateSseToCompletion(sseText) {
@@ -100,12 +103,29 @@ async function handleProxy(req, res, pathname) {
   if (cfg.forceModel) payload.model = cfg.forceModel;
   else if (!payload.model) payload.model = cfg.defaultModel || 'default';
 
+  // 模型名可带渠道前缀（traework/xxx）；无前缀走默认渠道，旧客户端零改动
+  const resolved = providers.resolveModel(payload.model);
+  const provider = providers.getProvider(resolved.kind);
+  if (!provider) {
+    util.sendJson(res, 400, { error: { message: `未知渠道: ${resolved.kind}`, type: 'invalid_request_error' } });
+    return true;
+  }
+  const isChat = CHAT_PATHS.has(pathname);
+  // Trae SOLO 通道只有 chat 能力；completions/embeddings 仅 CodeBuddy 支持
+  if (!isChat && resolved.kind !== 'codebuddy') {
+    util.sendJson(res, 400, {
+      error: { message: `渠道 ${resolved.kind} 仅支持 /v1/chat/completions`, type: 'invalid_request_error' },
+    });
+    return true;
+  }
+  // 上游请求体的 model 字段去掉渠道前缀（上游只认裸模型名）
+  payload.model = resolved.model;
+
   const isStream = payload.stream === true;
-  const isChat = upstreamPath === '/v2/chat/completions';
   const needAggregate = isChat && !isStream;
 
   if (isChat) {
-    sanitize.sanitizeChatPayload(payload);
+    // DEBUG dump 记录「净化前」的载荷，便于定位 11128 触发词
     if (process.env.CODEBUDDY_DEBUG) {
       try {
         let raw = null;
@@ -116,6 +136,10 @@ async function handleProxy(req, res, pathname) {
         logger.log('info', 'proxy', `debug dump -> ${require('os').tmpdir()}/codebuddy-debug-last-chat.json | msgs=[${(payload.messages || []).map((m) => `${m.role}:${JSON.stringify(m.content).length}${m.tool_calls ? `(tc:${m.tool_calls.length})` : ''}`).join(',')}] tools=${(payload.tools || []).length} | ${rkv}`);
       } catch { /* ignore */ }
     }
+    // 渠道专属请求体改写，只调用一次：
+    //   codebuddy -> 竞品词/指纹句净化（绕 11128）
+    //   traework  -> 转成 SOLO 格式（developer→system、function_call、stream 强制 true 等）
+    if (typeof provider.preparePayload === 'function') provider.preparePayload(payload);
   }
 
   if (needAggregate) payload.stream = true;
@@ -123,9 +147,9 @@ async function handleProxy(req, res, pathname) {
 
   const accountKey = auth.extractAccountKey(req, payload);
   let acct;
-  try { acct = await auth.pickAccountForRequest(accountKey, keyCheck.accountId || ''); }
+  try { acct = await auth.pickAccountForRequest(accountKey, keyCheck.accountId || '', resolved.kind); }
   catch (e) {
-    logger.log('warn', 'proxy', `${pathname} 拒绝: ${e.message}`, { pathname, model: payload.model });
+    logger.log('warn', 'proxy', `${pathname} 拒绝: ${e.message}`, { pathname, model: payload.model, provider: resolved.kind });
     util.sendJson(res, 401, { error: { message: e.message, type: 'authentication_error' } });
     return true;
   }
@@ -151,32 +175,41 @@ async function handleProxy(req, res, pathname) {
   };
 
   const headers = {
-    ...auth.buildChatRequestHeaders(acct),
+    ...provider.buildChatHeaders(acct),
     'Content-Type': 'application/json',
-    // 官方 CLI 即使流式也发 Accept: application/json（服务端按 body.stream 返回 SSE）
-    'Accept': 'application/json',
+    // 官方 CLI 即使流式也发 Accept: application/json（服务端按 body.stream 返回 SSE）；
+    // Trae 侧由 provider 自己的头决定 Accept，故仅在缺省时补
+    'Accept': headersAcceptFor(resolved.kind),
   };
-  const targetUrl = `${config.ENDPOINT}${upstreamPath}`;
+  const targetUrl = isChat ? provider.chatUrl(acct) : `${config.ENDPOINT}${upstreamPath}`;
   const startedAt = Date.now();
+  // 渠道专属流转换器（Trae 的 SOLO 事件流需要转换；CodeBuddy 返回 null 走默认路径）
+  const converter = isChat && isStream && typeof provider.createSseConverter === 'function'
+    ? provider.createSseConverter() : null;
+  const aggregateFn = isChat && typeof provider.aggregate === 'function'
+    ? provider.aggregate : aggregateSseToCompletion;
 
   try {
     if (needAggregate) {
       const r = await util.requestRaw(targetUrl, { method: 'POST', headers, body: jsonBody, timeoutMs });
       const ct = (r.headers && r.headers['content-type']) || '';
-      if (ct.includes('text/event-stream') || r.body.includes('chat.completion.chunk')) {
-        const completion = aggregateSseToCompletion(r.body);
+      const looksSse = ct.includes('text/event-stream') || r.body.includes('chat.completion.chunk');
+      // 上游报错时直接透传，不要当成 SSE 去聚合（否则错误体会被聚合成空回复）
+      const upstreamOk = r.status >= 200 && r.status < 300;
+      if (upstreamOk && (looksSse || resolved.kind !== 'codebuddy')) {
+        const completion = aggregateFn(r.body);
         logger.log('info', 'proxy', `${pathname} 完成 (${Date.now() - startedAt}ms)`, logger.requestSummary(payload, { stream: false, status: 200, durationMs: Date.now() - startedAt, tokens: completion.usage && completion.usage.total_tokens }));
         record(completion.usage, 'ok');
         util.sendJson(res, 200, completion);
       } else {
         logger.log('warn', 'proxy', `${pathname} 上游非流式响应 ${r.status}`, logger.requestSummary(payload, { status: r.status, durationMs: Date.now() - startedAt }));
-        record(null, r.status === 200 ? 'ok' : 'error');
+        record(null, upstreamOk ? 'ok' : 'error');
         res.writeHead(r.status, { 'Content-Type': ct || 'application/json', 'Access-Control-Allow-Origin': '*' });
         res.end(r.body);
       }
     } else if (isStream) {
       await util.pipeSseToClient(res, targetUrl, {
-        method: 'POST', headers, body: jsonBody,
+        method: 'POST', headers, body: jsonBody, converter,
         extraHeaders: { 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' },
       }, ({ usage, status }) => record(usage, status));
       logger.log('info', 'proxy', `${pathname} 流式结束 (${Date.now() - startedAt}ms)`, logger.requestSummary(payload, { stream: true, durationMs: Date.now() - startedAt }));
@@ -197,6 +230,11 @@ async function handleProxy(req, res, pathname) {
     else res.end();
   }
   return true;
+}
+
+/** CodeBuddy 官方 CLI 即使流式也发 Accept: application/json；Trae 需 text/event-stream */
+function headersAcceptFor(kind) {
+  return kind === 'codebuddy' ? 'application/json' : 'text/event-stream';
 }
 
 module.exports = { UPSTREAM_MAP, aggregateSseToCompletion, handleProxy };

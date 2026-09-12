@@ -1,7 +1,7 @@
 export default {
   app: {
-    title: 'CodeBuddy API Proxy',
-    subtitle: '把本地 CodeBuddy 登录态代理为 OpenAI 兼容接口',
+    title: 'Union API Proxy',
+    subtitle: '把多渠道（CodeBuddy / Trae CN）登录态聚合为 OpenAI 兼容接口',
   },
   nav: {
     overview: '总览',
@@ -110,6 +110,7 @@ export default {
     intl: '国际',
     cn: '国内',
     reasoning: '推理',
+    channel: '所属渠道',
     colSource: '来源',
     builtin: '内置',
     custom: '自定义',
@@ -365,7 +366,7 @@ export default {
     queryError: '查询登录进度失败',
   },
   footer: {
-    powered: 'CodeBuddy API Proxy',
+    powered: 'Union API Proxy',
   },
   build: {
     warnText: '前端源码已更新，但管理页尚未重新构建。请构建后重启服务：',

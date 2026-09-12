@@ -75,38 +75,50 @@ const MODEL_CATALOG = [
 ];
 
 /**
- * 把内置目录与数据库中的自定义模型合并（自定义模型覆盖同 id 内置项）。
- * hiddenIds：被隐藏的模型 id 集合（含内置与自定义）。被隐藏的模型标记 hidden:true，
- * 并按稳定顺序排到列表末尾（其余模型保持原顺序）。
+ * 把内置目录与数据库中的自定义模型合并（自定义模型覆盖同 provider+id 内置项）。
+ * hiddenIds：被隐藏的模型「对外 id」集合。多渠道下对外 id 形如 `traework/glm-5.2`；
+ * 默认渠道（codebuddy）保持裸 id 不变，保证旧客户端零改动。
  *
- * /api/* 管理接口返回全部（含 hidden 标记）；/v1/models 与 /models 通过
- * modelsResponse() 过滤掉 hidden 项后再对外返回。
+ * customModels 可带 provider 字段（缺省 codebuddy）。
+ * extra：其它渠道的内置模型 { traework: [ModelInfo, ...] }。
+ *
+ * /api/* 管理接口返回全部（含 hidden 标记）；/v1/models 与 /models 过滤 hidden 后返回。
  */
-function allModels(customModels, hiddenIds) {
-  const custom = customModels || [];
+function allModels(customModels, hiddenIds, extra) {
   const hidden = new Set(Array.isArray(hiddenIds) ? hiddenIds : []);
-  const byId = new Map();
-  for (const m of MODEL_CATALOG) byId.set(m.id, { ...m, builtin: true });
-  for (const m of custom) byId.set(m.id, { ...m, builtin: false });
-  const list = Array.from(byId.values()).map((m) => ({
-    ...m,
-    hidden: hidden.has(m.id),
-  }));
+  const byKey = new Map();
+  const put = (m, provider, builtin) => {
+    const p = provider || m.provider || 'codebuddy';
+    const key = p === 'codebuddy' ? m.id : p + '/' + m.id;
+    byKey.set(key, { ...m, provider: p, builtin: !!builtin, key });
+  };
+
+  for (const m of MODEL_CATALOG) put(m, 'codebuddy', true);
+  for (const [kind, list] of Object.entries(extra || {})) {
+    for (const m of (list || [])) put(m, kind, true);
+  }
+  for (const m of (customModels || [])) put(m, m.provider || 'codebuddy', false);
+
+  const list = Array.from(byKey.values()).map((m) => ({ ...m, hidden: hidden.has(m.key) }));
   // 稳定排序：仅把 hidden 项移到末尾，不改变其它项的原始相对顺序
-  const visible = list.filter((m) => !m.hidden);
-  const hiddenList = list.filter((m) => m.hidden);
-  return visible.concat(hiddenList);
+  return list.filter((m) => !m.hidden).concat(list.filter((m) => m.hidden));
 }
 
-function modelsResponse(customModels, hiddenIds) {
+/** 模型的对外 id（同时是隐藏标记所用的键） */
+function modelKey(m) {
+  const p = m.provider || 'codebuddy';
+  return p === 'codebuddy' ? m.id : p + '/' + m.id;
+}
+
+function modelsResponse(customModels, hiddenIds, extra) {
   const now = Math.floor(Date.now() / 1000);
-  const data = allModels(customModels, hiddenIds)
+  const data = allModels(customModels, hiddenIds, extra)
     .filter((m) => !m.hidden)
     .map((m) => ({
-      id: m.id, object: 'model', created: now, owned_by: 'codebuddy',
+      id: modelKey(m), object: 'model', created: now, owned_by: m.provider || 'codebuddy',
       name: m.name, is_default: !!m.isDefault,
     }));
   return { object: 'list', data };
 }
 
-module.exports = { MODEL_CATALOG, allModels, modelsResponse };
+module.exports = { MODEL_CATALOG, allModels, modelsResponse, modelKey };

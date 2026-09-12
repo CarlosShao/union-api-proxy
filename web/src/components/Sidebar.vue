@@ -20,7 +20,7 @@ const items = [
     <div class="brand">
       <span class="logo">¢</span>
       <div class="brand-text">
-        <div class="brand-name">CodeBuddy</div>
+        <div class="brand-name">Union API</div>
         <div class="brand-sub">API Proxy</div>
       </div>
     </div>

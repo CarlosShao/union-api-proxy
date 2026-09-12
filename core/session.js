@@ -58,6 +58,7 @@ function normalizePoolAccount(acct) {
   const source = acct.source || acct.addedBy || 'file';
   return {
     id: acct.id || genId(),
+    provider: acct.provider || 'codebuddy',
     name: acct.name || n.account.nickname || n.account.uid || '未命名',
     source,
     addedBy: acct.addedBy || source,
@@ -71,29 +72,46 @@ function normalizePoolAccount(acct) {
   };
 }
 
+/** 单渠道的默认池配置 */
+function defaultPool(provider) {
+  return { provider, mode: 'pool', strategy: 'round-robin', pinnedId: null, cursor: 0 };
+}
+
+/** 从旧版池结构里提取逐渠道池配置（旧数据结构只有一个全局 pool） */
+function normalizePoolsFromLegacy(raw, accounts) {
+  const pools = {};
+  if (raw && raw.pool && typeof raw.pool === 'object') {
+    pools['codebuddy'] = {
+      provider: 'codebuddy',
+      mode: raw.pool.mode === 'pinned' ? 'pinned' : 'pool',
+      strategy: raw.pool.strategy || 'round-robin',
+      pinnedId: raw.pool.pinnedId || null,
+      cursor: typeof raw.pool.cursor === 'number' ? raw.pool.cursor : 0,
+    };
+  }
+  // 为出现过的每个渠道补齐默认池配置，避免运行期 poolOf 反复创建
+  for (const a of accounts) {
+    const k = a.provider || 'codebuddy';
+    if (!pools[k]) pools[k] = defaultPool(k);
+  }
+  return pools;
+}
+
 /** 把旧版（单账号 session）或新版（池）数据归一化成池结构 */
 function normalizePool(data) {
   if (!data || typeof data !== 'object') return null;
   if (data.version === 2 && Array.isArray(data.accounts) && data.pool) {
     const accounts = data.accounts.map(normalizePoolAccount).filter(Boolean);
-    return {
-      version: 2,
-      pool: {
-        mode: data.pool.mode === 'pinned' ? 'pinned' : 'pool',
-        strategy: data.pool.strategy || 'round-robin',
-        pinnedId: data.pool.pinnedId || null,
-        cursor: typeof data.pool.cursor === 'number' ? data.pool.cursor : 0,
-      },
-      accounts,
-    };
+    return { version: 2, pools: normalizePoolsFromLegacy(data, accounts), accounts };
   }
   const norm = normalizeSession(data);
   if (!norm) return null;
   return {
     version: 2,
-    pool: { mode: 'pool', strategy: 'round-robin', pinnedId: null, cursor: 0 },
+    pools: {},
     accounts: [{
       id: genId(),
+      provider: 'codebuddy',
       name: norm.account.nickname || norm.account.uid || '账号 1',
       source: sessionSource || 'file',
       addedBy: sessionSource || 'file',
@@ -108,14 +126,15 @@ function normalizePool(data) {
 }
 
 function emptyPool() {
-  return { version: 2, pool: { mode: 'pool', strategy: 'round-robin', pinnedId: null, cursor: 0 }, accounts: [] };
+  return { version: 2, pools: {}, accounts: [] };
 }
 
-/** 从 SQLite 载入账号池到内存态 */
+/** 从 SQLite 载入账号池到内存态（账号一张表，池配置按渠道） */
 function loadFromDb() {
   const accounts = store.listAccountRows().map(function (r) {
     return {
       id: r.id,
+      provider: r.provider || 'codebuddy',
       name: r.name,
       source: r.source,
       addedBy: r.addedBy,
@@ -128,12 +147,18 @@ function loadFromDb() {
       createdAt: r.createdAt,
     };
   });
-  const poolCfg = store.getAccountPool();
-  state = {
-    version: 2,
-    pool: poolCfg.pool || { mode: 'pool', strategy: 'round-robin', pinnedId: null, cursor: 0 },
-    accounts,
-  };
+  // 各渠道的池配置（cursor 仅内存，重启归零无害）
+  const pools = {};
+  for (const [kind, cfg] of Object.entries(store.listAccountPools())) {
+    pools[kind] = {
+      provider: kind,
+      mode: cfg.pool && cfg.pool.mode === 'pinned' ? 'pinned' : 'pool',
+      strategy: (cfg.pool && cfg.pool.strategy) || 'round-robin',
+      pinnedId: (cfg.pool && cfg.pool.pinnedId) || null,
+      cursor: (cfg.pool && typeof cfg.pool.cursor === 'number') ? cfg.pool.cursor : 0,
+    };
+  }
+  state = { version: 2, pools, accounts };
   return true;
 }
 
@@ -147,11 +172,12 @@ function migrateLegacySession() {
   if (!fs.existsSync(file)) return false;
   try {
     const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
-    const pool = normalizePool(raw);
-    if (!pool || !pool.accounts.length) return false;
-    for (const acct of pool.accounts) {
+    const payload = normalizePool(raw);
+    if (!payload || !payload.accounts.length) return false;
+    for (const acct of payload.accounts) {
       store.insertAccount({
         id: acct.id,
+        provider: acct.provider || 'codebuddy',
         name: acct.name,
         source: acct.source || 'file',
         addedBy: 'migrate',               // 添加方式统一标记为 migrate（从旧 session.json 迁移）
@@ -163,8 +189,9 @@ function migrateLegacySession() {
         createdAt: acct.createdAt,
       });
     }
-    store.setAccountPool(pool);
-    logger.log('info', 'system', '已从旧 session.json 迁移 ' + pool.accounts.length + ' 个账号到数据库');
+    // 旧文件不分渠道，其池配置归入默认渠道
+    if (payload.pool) store.setAccountPool({ version: 2, pool: payload.pool }, 'codebuddy');
+    logger.log('info', 'system', '已从旧 session.json 迁移 ' + payload.accounts.length + ' 个账号到数据库');
     // 迁移成功后重命名旧文件，避免后续被误读（保留一份可回滚的 .migrated 备份）
     const bak = file + '.migrated';
     try {
@@ -200,12 +227,18 @@ function loadSession() {
 function persistPool() {
   if (!state) return;
   try {
-    store.setAccountPool(state);
+    // 池配置按渠道分别落库
+    for (const [kind, p] of Object.entries(state.pools || {})) {
+      store.setAccountPool({ version: 2, pool: {
+        mode: p.mode, strategy: p.strategy, pinnedId: p.pinnedId, cursor: p.cursor,
+      } }, kind);
+    }
     // 账号行以逐条 upsert 同步（以内存态为准）
     const knownIds = new Set(state.accounts.map(function (a) { return a.id; }));
     for (const acct of state.accounts) {
       store.insertAccount({
         id: acct.id,
+        provider: acct.provider || 'codebuddy',
         name: acct.name,
         source: acct.source,
         addedBy: acct.addedBy || acct.source,
@@ -244,7 +277,7 @@ function clearSession() {
   sessionSource = '';
   try {
     for (const r of store.listAccountRows()) store.deleteAccountRow(r.id);
-    store.setAccountPool(emptyPool());
+    for (const kind of Object.keys(store.listAccountPools())) store.setAccountPool(store.defaultPoolConfig(), kind);
   } catch (e) { /* ignore */ }
 }
 
@@ -258,8 +291,20 @@ function setPool(pool, source) {
 
 /* ---------------- 账号操作 ---------------- */
 
-function listAccounts() {
-  return state ? state.accounts.slice() : [];
+function listAccounts(provider) {
+  if (!state) return [];
+  if (!provider) return state.accounts.slice();
+  return state.accounts.filter(function (a) { return (a.provider || 'codebuddy') === provider; });
+}
+
+/** 各渠道账号数：{ codebuddy: n, traework: m } */
+function accountCountsByProvider() {
+  const out = {};
+  for (const a of (state ? state.accounts : [])) {
+    const k = a.provider || 'codebuddy';
+    out[k] = (out[k] || 0) + 1;
+  }
+  return out;
 }
 
 function getAccount(id) {
@@ -294,10 +339,17 @@ function updateAccount(id, patch) {
     if (patch.useCount != null) acct.useCount = patch.useCount;
     if (patch.source) acct.source = patch.source;
     if (patch.addedBy) acct.addedBy = patch.addedBy;
+    // auth 可能带 Trae 专有的 machineId/deviceId/apiHost，normalizeSession 会丢掉，需补回
+    if (patch.auth && typeof patch.auth === 'object') {
+      for (const k of ['machineId', 'deviceId', 'apiHost']) {
+        if (patch.auth[k] !== undefined) acct.auth[k] = patch.auth[k];
+      }
+    }
   }
   // 单行同步落库（微秒级）：token 刷新等场景不再触发 500ms 后的全量池重写（那会在流式响应中途阻塞事件循环）
   try {
     store.updateAccountRow(acct.id, {
+      provider: acct.provider || 'codebuddy',
       name: acct.name,
       source: acct.source,
       addedBy: acct.addedBy || acct.source,
@@ -318,7 +370,10 @@ function removeAccount(id) {
   if (!state) return false;
   const before = state.accounts.length;
   state.accounts = state.accounts.filter(function (a) { return a.id !== id; });
-  if (state.pool && state.pool.pinnedId === id) state.pool.pinnedId = null;
+  // 清掉各渠道池里指向该账号的 pinned
+  for (const kind of Object.keys(state.pools || {})) {
+    if (state.pools[kind].pinnedId === id) state.pools[kind].pinnedId = null;
+  }
   const removed = state.accounts.length < before;
   if (removed) {
     persistPool();
@@ -330,18 +385,26 @@ function removeAccount(id) {
 
 /* ---------------- 池模式 / 选号 ---------------- */
 
-function getPoolConfig() {
-  return state ? Object.assign({}, state.pool) : { mode: 'pool', strategy: 'round-robin', pinnedId: null, cursor: 0 };
+/** 取（必要时创建）某渠道的池配置 */
+function poolOf(provider) {
+  const kind = provider || 'codebuddy';
+  if (!state) state = emptyPool();
+  if (!state.pools) state.pools = {};
+  if (!state.pools[kind]) state.pools[kind] = defaultPool(kind);
+  return state.pools[kind];
 }
 
-function setPoolConfig(patch) {
-  if (!state) state = emptyPool();
-  const p = state.pool;
+function getPoolConfig(provider) {
+  return Object.assign({}, poolOf(provider));
+}
+
+function setPoolConfig(patch, provider) {
+  const p = poolOf(provider);
   if (patch.mode === 'pinned' || patch.mode === 'pool') p.mode = patch.mode;
   if (patch.strategy) p.strategy = patch.strategy;
   if (patch.pinnedId !== undefined) p.pinnedId = patch.pinnedId || null;
   persistPool();
-  return getPoolConfig();
+  return getPoolConfig(provider);
 }
 
 function isExpiringAuth(auth) {
@@ -362,19 +425,21 @@ function isExpiringAuth(auth) {
 }
 
 /** 挑出一个账号（不自动刷新；刷新由 auth.js 负责）。返回账号或 null */
-function pickAccount(explicitKey) {
+function pickAccount(explicitKey, provider) {
   if (!state || !state.accounts.length) return null;
-  const p = state.pool;
+  const kind = provider || 'codebuddy';
+  const inKind = function (a) { return (a.provider || 'codebuddy') === kind; };
   if (explicitKey) {
     const found = findAccountByIdOrName(explicitKey);
-    return found || null;
+    return (found && inKind(found)) ? found : null;
   }
+  const p = poolOf(kind);
   if (p.mode === 'pinned' && p.pinnedId) {
     const pinned = getAccount(p.pinnedId);
-    if (pinned) return pinned;
+    if (pinned && inKind(pinned)) return pinned;
   }
-  const valid = state.accounts.filter(function (a) { return a.auth && a.auth.accessToken; });
-  if (!valid.length) return state.accounts[0];
+  const valid = state.accounts.filter(function (a) { return inKind(a) && a.auth && a.auth.accessToken; });
+  if (!valid.length) return null;
   const cursor = ((p.cursor || 0) % valid.length + valid.length) % valid.length;
   p.cursor = (cursor + 1) % valid.length;
   // cursor 只留在内存：轮询游标无需即时落库，重启后归零无害
@@ -394,16 +459,25 @@ function markUsed(id) {
 
 /* ---------------- 兼容旧 API ---------------- */
 
-function isLoggedIn() { return !!(state && state.accounts.some(function (a) { return a.auth && a.auth.accessToken; })); }
+function isLoggedIn(provider) {
+  if (!state) return false;
+  const list = provider
+    ? state.accounts.filter(function (a) { return (a.provider || 'codebuddy') === provider; })
+    : state.accounts;
+  return list.some(function (a) { return a.auth && a.auth.accessToken; });
+}
 
-/** 返回「活跃账号」用于启动日志 / 状态展示兼容：pinned 或第一个 */
-function getActiveAccount() {
+/** 返回「活跃账号」用于启动日志 / 状态展示兼容：pinned 或该渠道第一个 */
+function getActiveAccount(provider) {
   if (!state || !state.accounts.length) return null;
-  if (state.pool.mode === 'pinned' && state.pool.pinnedId) {
-    const pinned = getAccount(state.pool.pinnedId);
-    if (pinned) return pinned;
+  const kind = provider || 'codebuddy';
+  const inKind = function (a) { return (a.provider || 'codebuddy') === kind; };
+  const p = (state.pools && state.pools[kind]) || null;
+  if (p && p.mode === 'pinned' && p.pinnedId) {
+    const pinned = getAccount(p.pinnedId);
+    if (pinned && inKind(pinned)) return pinned;
   }
-  return state.accounts[0];
+  return state.accounts.find(inKind) || null;
 }
 
 function getSession() { return getActiveAccount(); }
@@ -444,7 +518,7 @@ function getSessionSource() { return sessionSource; }
 module.exports = {
   normalizeSession, normalizePool, loadSession, saveSession, clearSession,
   getPool, setPool, getPoolConfig, setPoolConfig,
-  listAccounts, getAccount, findAccountByIdOrName,
+  listAccounts, accountCountsByProvider, getAccount, findAccountByIdOrName,
   addAccount, updateAccount, removeAccount,
   isExpiringAuth, pickAccount, markUsed, getActiveAccount,
   isLoggedIn, getSession, setSession, getSessionSource,

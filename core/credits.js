@@ -25,21 +25,14 @@ const store = require('./store');
 
 const WORKBUDDY_CLIENT_VERSION = '5.3.14';
 
-/** 根据 accountId 解析账号并生成带鉴权 + 客户端标识的请求头 */
-async function pickHeaders(accountId) {
-  let acct = null;
-  if (accountId) {
-    acct = sessionMod.getAccount(accountId);
-    if (!acct) {
-      const e = new Error('未找到账号: ' + accountId);
-      e.status = 404;
-      throw e;
-    }
-    acct = await auth.getValidAccount(acct);
-  } else {
-    acct = await auth.getValidSession();
-  }
-  const headers = Object.assign({}, auth.buildAuthHeaders(acct), {
+/** 取账号所属渠道（缺省 codebuddy） */
+function providerOf(acct) {
+  return (acct && acct.provider) || 'codebuddy';
+}
+
+/** 默认渠道（CodeBuddy）：走 billing 接口拉取积分资源 */
+async function fetchCodebuddyResources(account) {
+  const headers = Object.assign({}, auth.buildAuthHeaders(account), {
     Accept: 'application/json',
     'X-Product': 'WorkBuddy',
     'X-IDE-Type': 'WorkBuddy',
@@ -47,16 +40,6 @@ async function pickHeaders(accountId) {
     'X-IDE-Version': WORKBUDDY_CLIENT_VERSION,
     'User-Agent': 'WorkBuddy/' + WORKBUDDY_CLIENT_VERSION,
   });
-  return { headers, account: acct };
-}
-
-/**
- * 查询账号积分余额。
- * @param {string} [accountId] 指定账号 id；缺省用活跃账号
- * @returns {Promise<object>} { ok, usageLeft, usageTotal, usageUsed, resources, account, accountId }
- */
-async function getCredits(accountId) {
-  const { headers, account } = await pickHeaders(accountId);
   const body = {
     PageNumber: 1,
     PageSize: 100,
@@ -70,22 +53,75 @@ async function getCredits(accountId) {
   const json = r.json || {};
   if (r.status >= 400 || (json.code !== undefined && json.code !== 0)) {
     const msg = json.msg || json.message || ('HTTP ' + r.status);
-    logger.log('warn', 'auth', '查询积分余额失败: ' + msg);
-    return { ok: false, error: msg, account: account ? (account.name || account.account.uid) : '', accountId: account ? account.id : accountId };
+    throw new Error(msg);
   }
   const accounts = json.data?.Response?.Data?.Accounts || [];
-  const resources = accounts.map((a) => {
-    const left = Number(a.CycleCapacityRemainPrecise) || 0;
-    const total = Number(a.CycleCapacitySizePrecise) || 0;
-    return {
-      packageCode: a.PackageCode || '',
-      packageName: a.PackageName || '',
-      left,
-      total,
-      used: Math.max(0, total - left),
-      expireAt: a.DeductionEndTime || a.CycleEndTime || '',
-    };
-  });
+  return {
+    code: json.code,
+    msg: json.msg,
+    resources: accounts.map((a) => {
+      const left = Number(a.CycleCapacityRemainPrecise) || 0;
+      const total = Number(a.CycleCapacitySizePrecise) || 0;
+      return {
+        packageCode: a.PackageCode || '',
+        packageName: a.PackageName || '',
+        left,
+        total,
+        used: Math.max(0, total - left),
+        expireAt: a.DeductionEndTime || a.CycleEndTime || '',
+      };
+    }),
+  };
+}
+
+/**
+ * 查询账号积分余额。
+ * @param {string} [accountId] 指定账号 id；缺省用活跃账号
+ * @returns {Promise<object>} { ok, usageLeft, usageTotal, usageUsed, resources, account, accountId }
+ */
+async function getCredits(accountId) {
+  // 解析账号（非默认渠道需先拿到账号才能分派）
+  let pre = null;
+  if (accountId) {
+    pre = sessionMod.getAccount(accountId);
+    if (!pre) {
+      const e = new Error('未找到账号: ' + accountId);
+      e.status = 404;
+      throw e;
+    }
+  }
+  let fetched;
+  let account;
+  try {
+    if (pre && providerOf(pre) !== 'codebuddy') {
+      const provider = require('./providers/all').getProvider(providerOf(pre));
+      if (!provider || typeof provider.creditDetail !== 'function') {
+        return { ok: false, error: '该渠道不支持积分查询', account: pre.name || '', accountId: pre.id };
+      }
+      account = await auth.getValidAccount(pre);
+      const items = await provider.creditDetail(account.id, account);
+      fetched = {
+        code: 0,
+        msg: '',
+        resources: items.map((it) => ({
+          packageCode: '', packageName: it.name || '',
+          left: it.remain || 0, total: it.total || 0, used: it.used || 0, expireAt: '',
+        })),
+      };
+    } else {
+      let acctResolved = pre;
+      if (!acctResolved) acctResolved = await auth.getValidSession();
+      else acctResolved = await auth.getValidAccount(acctResolved);
+      account = acctResolved;
+      fetched = await fetchCodebuddyResources(account);
+    }
+  } catch (e) {
+    logger.log('warn', 'auth', '查询积分余额失败: ' + e.message);
+    const label = account ? (account.name || account.account.uid) : (pre ? pre.name : '');
+    return { ok: false, error: e.message, account: label, accountId: account ? account.id : (pre ? pre.id : accountId) };
+  }
+
+  const { resources } = fetched;
   const usageLeft = resources.reduce((s, x) => s + x.left, 0);
   const usageTotal = resources.reduce((s, x) => s + x.total, 0);
   const usageUsed = resources.reduce((s, x) => s + x.used, 0);
@@ -107,8 +143,8 @@ async function getCredits(accountId) {
 
   return {
     ok: true,
-    code: json.code,
-    msg: json.msg,
+    code: fetched.code,
+    msg: fetched.msg,
     usageLeft,
     usageTotal,
     usageUsed,

@@ -28,6 +28,16 @@ const checkinMap = ref({});
 const checkinLoading = ref(false);
 const checkingId = ref('');
 
+// 渠道（provider）：tab 切换；pools 保存各渠道的池配置与账号数
+const providers = ref([]);
+const activeChannel = ref('codebuddy');
+const pools = ref({});
+const activeProvider = computed(() => providers.value.find((p) => p.kind === activeChannel.value) || { kind: activeChannel.value, label: activeChannel.value });
+const activePool = computed(() => pools.value[activeChannel.value] || { mode: 'pool', strategy: 'round-robin', pinnedId: null, accountCount: 0 });
+
+// 当前渠道的账号（账号表按渠道过滤展示）
+const channelAccounts = computed(() => accounts.value.filter((a) => (a.provider || 'codebuddy') === activeChannel.value));
+
 // 积分余额：每个账号的剩余/总积分，key 为账号 id
 const creditsMap = ref({});
 const creditsLoading = ref(false);
@@ -45,7 +55,13 @@ async function load() {
   try {
     const r = await api.listAccounts();
     accounts.value = r.accounts || [];
-    pool.value = r.pool || { mode: 'pool', strategy: 'round-robin', pinnedId: null };
+    providers.value = r.providers || [];
+    pools.value = r.pools || {};
+    // 渠道列表变化时修正当前选中项，避免指向不存在的渠道
+    if (providers.value.length && !providers.value.some((p) => p.kind === activeChannel.value)) {
+      activeChannel.value = providers.value[0].kind;
+    }
+    pool.value = r.pools?.[activeChannel.value] || r.pool || { mode: 'pool', strategy: 'round-robin', pinnedId: null };
     autoCheckin.value = r.autoCheckin !== false;
   } catch (e) {
     notice.value = t('common.error') + ': ' + e.message;
@@ -54,6 +70,13 @@ async function load() {
   }
   loadCheckinAll();
   loadCreditsAll();
+}
+
+// 切换渠道 tab：账号列表按渠道过滤，池配置随之切换
+function switchChannel(kind) {
+  activeChannel.value = kind;
+  pool.value = pools.value[kind] || { mode: 'pool', strategy: 'round-robin', pinnedId: null };
+  load();
 }
 
 // 查询单个账号的积分余额
@@ -159,7 +182,7 @@ function todayUsedText(acct) {
 
 async function setMode(v) {
   try {
-    const r = await api.setPool({ mode: v });
+    const r = await api.setPool({ mode: v, provider: activeChannel.value });
     pool.value = r;
     notice.value = '';
   } catch (e) {
@@ -169,7 +192,7 @@ async function setMode(v) {
 
 async function pin(id) {
   try {
-    const r = await api.setPool({ mode: 'pinned', pinnedId: id });
+    const r = await api.setPool({ mode: 'pinned', pinnedId: id, provider: activeChannel.value });
     pool.value = r;
     notice.value = '';
   } catch (e) {
@@ -187,7 +210,7 @@ async function openAdd() {
 async function doAdd() {
   const name = newName.value.trim();
   try {
-    const d = await api.accountLogin(name);
+    const d = await api.accountLogin(name, activeChannel.value);
     window.open(d.authUrl, '_blank');
     notice.value = t('accounts.loginStarted');
     pollLogin(d.state);
@@ -337,10 +360,25 @@ load();
           </span>
         </h2>
         <div class="head-actions">
-          <button v-if="!vscodeAccountExists" class="btn btn-ghost" @click="openVscode">{{ t('accounts.vscode') }}</button>
-          <button class="btn btn-ghost" @click="openImport">{{ t('accounts.import') }}</button>
+          <!-- VSCode 插件导入的是 CodeBuddy 登录态，仅该渠道显示 -->
+          <button v-if="activeChannel === 'codebuddy' && !vscodeAccountExists" class="btn btn-ghost" @click="openVscode">{{ t('accounts.vscode') }}</button>
+          <button v-if="activeChannel === 'codebuddy'" class="btn btn-ghost" @click="openImport">{{ t('accounts.import') }}</button>
           <button class="btn btn-primary" @click="openAdd">{{ t('accounts.add') }}</button>
         </div>
+      </div>
+
+      <!-- 渠道切换：每个渠道有独立的账号池与池配置 -->
+      <div v-if="providers.length > 1" class="channel-tabs">
+        <button
+          v-for="p in providers"
+          :key="p.kind"
+          class="channel-tab"
+          :class="{ active: p.kind === activeChannel }"
+          @click="switchChannel(p.kind)"
+        >
+          {{ p.label }}
+          <span class="channel-count">{{ (pools[p.kind] && pools[p.kind].accountCount) || 0 }}</span>
+        </button>
       </div>
 
       <div class="mode-row">
@@ -377,7 +415,7 @@ load();
       <p v-if="notice" class="hint notice">{{ notice }}</p>
 
       <div v-if="loading" class="muted">{{ t('common.loading') }}</div>
-      <div v-else-if="!accounts.length" class="muted">{{ t('accounts.empty') }}</div>
+      <div v-else-if="!channelAccounts.length" class="muted">{{ t('accounts.empty') }}</div>
 
       <div v-else class="table-wrap">
         <table class="table">
@@ -395,7 +433,7 @@ load();
             </tr>
           </thead>
           <tbody>
-            <tr v-for="a in accounts" :key="a.id" :class="{ pinned: pool.mode === 'pinned' && pool.pinnedId === a.id }">
+            <tr v-for="a in channelAccounts" :key="a.id" :class="{ pinned: pool.mode === 'pinned' && pool.pinnedId === a.id }">
               <td class="strong">
                 <span v-if="pool.mode === 'pinned' && pool.pinnedId === a.id" class="badge badge-primary">{{ t('accounts.pinnedBadge') }}</span>
                 {{ a.name || '-' }}
@@ -472,6 +510,21 @@ load();
 <style scoped>
 .head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
 .head-actions { display: flex; align-items: center; gap: 8px; }
+/* 渠道切换 tab：每个渠道独立的账号池 */
+.channel-tabs { display: flex; gap: 6px; margin: 4px 0 14px; border-bottom: 1px solid var(--border); }
+.channel-tab {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 14px; font-size: 13px; font-weight: 600;
+  background: none; border: none; border-bottom: 2px solid transparent;
+  color: var(--text-2); cursor: pointer; margin-bottom: -1px;
+}
+.channel-tab:hover { color: var(--text-1); }
+.channel-tab.active { color: var(--primary); border-bottom-color: var(--primary); }
+.channel-count {
+  display: inline-block; min-width: 18px; padding: 0 5px;
+  font-size: 11px; line-height: 17px; text-align: center;
+  background: var(--bg-3, rgba(127,127,127,.15)); border-radius: 9px; color: var(--text-2);
+}
 .mode-row { display: flex; align-items: center; gap: 18px; margin: 8px 0 14px; flex-wrap: wrap; }
 .mode-spacer { flex: 1; min-width: 12px; }
 .mode-label { font-size: 13px; color: var(--text-2); font-weight: 600; }

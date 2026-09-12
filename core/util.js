@@ -128,8 +128,14 @@ function normalizeSseBlock(block) {
  * 把上游 SSE 流转发到客户端，同时解析其中的 token 用量。
  * onDone({ usage, status }) 在流结束时回调。usage 为 OpenAI chat.completion.chunk 里的 usage 对象。
  * 兼容 `stream_options.include_usage` 的最后一块，也兼容流结束后单独追加的 usage 块。
+ *
+ * converter：可选的渠道专属「上游流 -> OpenAI SSE」转换器（如 Trae 的 SOLO 事件流）。
+ *   提供时，上游字节先喂给 feed()，其输出再经 normalizeSseBlock 收尾后下发；
+ *   不提供时走默认路径（上游本身已是 OpenAI SSE，只做空字段剥离）。
+ *   两种路径最终都经过 normalizeSseBlock —— 这是防止 AI SDK 把思考 delta
+ *   切成大量碎片（UI 表现为反复「思考了几秒」）的关键，对所有渠道一视同仁。
  */
-function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, body = null, extraHeaders = {} }, onDone) {
+function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, body = null, extraHeaders = {}, converter = null }, onDone) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlStr);
     const mod = u.protocol === 'https:' ? https : http;
@@ -148,10 +154,73 @@ function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, bod
     let lastChunkAt = startedAt;
     let firstChunk = true;
 
+    /** 从一段 OpenAI SSE 文本里提取 usage（两种路径共用） */
+    const extractUsage = (text) => {
+      for (const line of text.split('\n')) {
+        const t = line.trim();
+        if (!t.startsWith('data:')) continue;
+        const data = t.slice(5).trim();
+        if (!data || data === '[DONE]') continue;
+        try {
+          const obj = JSON.parse(data);
+          if (obj && obj.usage) usage = obj.usage;
+        } catch { /* skip */ }
+      }
+    };
+
     const upstream = mod.request(u, { method, headers: finalHeaders, agent: agentFor(u.protocol) }, (upRes) => {
       const respHeaders = { ...(upRes.headers || {}), ...extraHeaders };
       clientRes.writeHead(upRes.statusCode || 502, respHeaders);
-      if (upRes.statusCode !== 200) status = 'error';
+      const upstreamOk = upRes.statusCode >= 200 && upRes.statusCode < 300;
+      if (!upstreamOk) status = 'error';
+
+      // 上游报错：原始体直接透传，不能喂给转换器（会把错误文本转成空回复）
+      if (!upstreamOk) {
+        upRes.pipe(clientRes);
+        upRes.on('end', () => { report(); resolve(); });
+        upRes.on('error', (e) => { report(); reject(e); });
+        return;
+      }
+
+      // 转换器模式下上游是自定义事件流，按 \n\n 切块无意义，必须整段喂给 converter
+      if (converter) {
+        let pending = '';
+        const emit = (text) => {
+          if (!text) return;
+          const normalized = normalizeSseBlock(text.replace(/\n+$/, ''));
+          extractUsage(normalized);
+          clientRes.write(normalized + '\n\n');
+          pending = '';
+        };
+        upRes.setEncoding('utf8');
+        upRes.on('data', (chunk) => {
+          const now = Date.now();
+          if (debugGaps) {
+            const gap = now - lastChunkAt;
+            if (firstChunk) console.log(`[sse-debug] 首字节 TTFB ${gap}ms`);
+            else if (gap >= 500) console.log(`[sse-debug] chunk 间隙 ${gap}ms（事件循环停顿或上游断流）`);
+          }
+          lastChunkAt = now;
+          firstChunk = false;
+          try { pending += converter.feed(chunk); } catch { /* 转换异常不中断流 */ }
+          if (pending) emit(pending);
+        });
+        upRes.on('end', () => {
+          try { pending += converter.end(); } catch { /* ignore */ }
+          emit(pending);
+          // 转换器可能把 usage 保留在内部状态（如 token_usage 事件先于末块到达）
+          if (!usage && typeof converter.getUsage === 'function') {
+            try { usage = converter.getUsage(); } catch { /* ignore */ }
+          }
+          clientRes.end();
+          report();
+          resolve();
+        });
+        upRes.on('error', (e) => { status = 'error'; report(); reject(e); });
+        if (payload != null) upstream.write(payload);
+        upstream.end();
+        return;
+      }
 
       let buf = '';
       upRes.setEncoding('utf8');
@@ -171,32 +240,14 @@ function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, bod
           const block = buf.slice(0, idx);
           buf = buf.slice(idx + 2);
           out += normalizeSseBlock(block) + '\n\n';
-          for (const line of block.split('\n')) {
-            const t = line.trim();
-            if (!t.startsWith('data:')) continue;
-            const data = t.slice(5).trim();
-            if (!data || data === '[DONE]') continue;
-            try {
-              const obj = JSON.parse(data);
-              if (obj && obj.usage) usage = obj.usage;
-            } catch { /* skip */ }
-          }
+          extractUsage(block);
         }
         if (out) clientRes.write(out);
       });
       upRes.on('end', () => {
         if (buf.trim()) {
           clientRes.write(normalizeSseBlock(buf) + '\n\n');
-          for (const line of buf.split('\n')) {
-            const t = line.trim();
-            if (!t.startsWith('data:')) continue;
-            const data = t.slice(5).trim();
-            if (!data || data === '[DONE]') continue;
-            try {
-              const obj = JSON.parse(data);
-              if (obj && obj.usage) usage = obj.usage;
-            } catch { /* skip */ }
-          }
+          extractUsage(buf);
         }
         clientRes.end();
         report();

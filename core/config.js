@@ -9,16 +9,28 @@ const os = require('os');
 const path = require('path');
 const { URL } = require('url');
 
-const PORT = parseInt(process.env.PORT || process.env.CODEBUDDY_PROXY_PORT || '3800', 10);
-const HOST = process.env.HOST || process.env.CODEBUDDY_PROXY_HOST || '127.0.0.1';
+/**
+ * 读取环境变量：优先 UNION_* 前缀，其次兼容历史 CODEBUDDY_* 前缀，最后默认值。
+ * 向后兼容既有启动命令（CODEBUDDY_PROXY_PORT 等继续生效）。
+ */
+function env(name, fallback) {
+  const v = process.env['UNION_' + name];
+  if (v !== undefined && v !== '') return v;
+  const legacy = process.env['CODEBUDDY_' + name];
+  if (legacy !== undefined && legacy !== '') return legacy;
+  return fallback;
+}
 
-const ENDPOINT = (process.env.CODEBUDDY_ENDPOINT || 'https://copilot.tencent.com').replace(/\/+$/, '');
-const PREFIX_PATH = process.env.CODEBUDDY_PREFIX_PATH || '/plugin';
-const PLATFORM = process.env.CODEBUDDY_PLATFORM || 'VSCode';
+const PORT = parseInt(process.env.PORT || env('PROXY_PORT', '3800'), 10);
+const HOST = process.env.HOST || env('PROXY_HOST', '127.0.0.1');
 
-const DATA_DIR = process.env.CODEBUDDY_DATA_DIR || path.join(os.homedir(), '.codebuddy-proxy');
-const SESSION_FILE = process.env.CODEBUDDY_SESSION_FILE || path.join(DATA_DIR, 'session.json');
-const DB_FILE = process.env.CODEBUDDY_DB_FILE || path.join(DATA_DIR, 'proxy.db');
+const ENDPOINT = (env('ENDPOINT', 'https://copilot.tencent.com')).replace(/\/+$/, '');
+const PREFIX_PATH = env('PREFIX_PATH', '/plugin');
+const PLATFORM = env('PLATFORM', 'VSCode');
+
+const DATA_DIR = env('DATA_DIR', path.join(os.homedir(), '.union-api-proxy'));
+const SESSION_FILE = env('SESSION_FILE', path.join(DATA_DIR, 'session.json'));
+const DB_FILE = env('DB_FILE', path.join(DATA_DIR, 'proxy.db'));
 
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 
@@ -34,15 +46,15 @@ const VERSION = (() => {
   try { return require('../package.json').version || '1.0.0'; } catch { return '1.0.0'; }
 })();
 
-const ADMIN_USERNAME = process.env.CODEBUDDY_ADMIN_USERNAME || 'admin';
-const ADMIN_PASSWORD = process.env.CODEBUDDY_ADMIN_PASSWORD || '';
+const ADMIN_USERNAME = env('ADMIN_USERNAME', 'admin');
+const ADMIN_PASSWORD = env('ADMIN_PASSWORD', '');
 
 /**
  * 是否信任反向代理（如 Cloudflare / nginx）注入的 X-Forwarded-For。
  * 仅在确认服务只被受信代理访问时设为 true，否则限流/日志将信任客户端可伪造的 IP。
  * 取值：'true' | '1' 开启；其余（含空）关闭。
  */
-const TRUST_PROXY = process.env.CODEBUDDY_TRUST_PROXY === 'true' || process.env.CODEBUDDY_TRUST_PROXY === '1';
+const TRUST_PROXY = env('TRUST_PROXY', '') === 'true' || env('TRUST_PROXY', '') === '1';
 
 /** 会话 Cookie 名称（HttpOnly，前端不可读） */
 const ADMIN_COOKIE = 'cbp_admin';
@@ -63,11 +75,11 @@ const DEFAULT_CONFIG = {
   'logging.level': 'info',            // debug | info | warn | error
   'logging.retentionDays': '7',       // 日志保留天数，0 = 永久
   'logging.maxRows': '10000',         // 日志条数上限，超出后删除最旧，0 = 不限制
-  'autoOpen': process.env.CODEBUDDY_NO_OPEN ? 'false' : 'true',
-  'defaultModel': process.env.CODEBUDDY_DEFAULT_MODEL || 'default',
-  'forceModel': process.env.CODEBUDDY_FORCE_MODEL || '',
+  'autoOpen': env('NO_OPEN', '') ? 'false' : 'true',
+  'defaultModel': env('DEFAULT_MODEL', 'default'),
+  'forceModel': env('FORCE_MODEL', ''),
   'apiKeyEnabled': 'true',                            // 是否校验客户端访问 /v1 与 /responses 所需的 API 密钥
-  'apiKey': process.env.CODEBUDDY_API_KEY || '',      // 兼容旧版：单个 API 密钥（新实现优先使用 api_keys 表）
+  'apiKey': env('API_KEY', ''),                       // 兼容旧版：单个 API 密钥（新实现优先使用 api_keys 表）
   'adminAuthEnabled': 'false',         // 是否开启管理页/管理接口鉴权（登录后访问）
   'requestTimeoutMs': '300000',       // 上游请求超时
   'cors.origin': '*',                 // CORS Allow-Origin

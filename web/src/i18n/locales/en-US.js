@@ -1,7 +1,7 @@
 export default {
   app: {
-    title: 'CodeBuddy API Proxy',
-    subtitle: 'Proxy local CodeBuddy auth into an OpenAI-compatible API',
+    title: 'Union API Proxy',
+    subtitle: 'Aggregate multi-channel (CodeBuddy / Trae CN) auth into an OpenAI-compatible API',
   },
   nav: {
     overview: 'Overview',
@@ -110,6 +110,7 @@ export default {
     intl: 'Intl',
     cn: 'CN',
     reasoning: 'Reasoning',
+    channel: 'Channel',
     colSource: 'Source',
     builtin: 'Built-in',
     custom: 'Custom',
@@ -365,7 +366,7 @@ export default {
     queryError: 'Failed to query progress',
   },
   footer: {
-    powered: 'CodeBuddy API Proxy',
+    powered: 'Union API Proxy',
   },
   build: {
     warnText: 'Frontend source changed, but the admin page has not been rebuilt. Build and restart the server:',

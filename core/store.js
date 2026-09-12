@@ -150,7 +150,8 @@ function getDb() {
     );
 
     CREATE TABLE IF NOT EXISTS models (
-      id               TEXT PRIMARY KEY,
+      id               TEXT NOT NULL,                     -- 裸模型 id（对外 id = provider + '/' + id）
+      provider         TEXT NOT NULL DEFAULT 'codebuddy', -- 渠道；与 id 组成主键，容许两家同名模型共存
       name             TEXT NOT NULL,
       max_input_tokens  INTEGER NOT NULL DEFAULT 0,
       max_output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -158,7 +159,8 @@ function getDb() {
       vision           INTEGER NOT NULL DEFAULT 0,
       reasoning        INTEGER NOT NULL DEFAULT 0,
       region           TEXT NOT NULL DEFAULT 'cn',
-      created_at       INTEGER NOT NULL
+      created_at       INTEGER NOT NULL,
+      PRIMARY KEY (provider, id)
     );
 
     CREATE TABLE IF NOT EXISTS api_keys (
@@ -197,6 +199,7 @@ function getDb() {
     -- 账号池：登录态（含 accessToken/refreshToken 等敏感凭证）与账号信息
     CREATE TABLE IF NOT EXISTS accounts (
       id            TEXT PRIMARY KEY,
+      provider      TEXT NOT NULL DEFAULT 'codebuddy', -- 渠道：codebuddy | traework（模型前缀同此值）
       name          TEXT NOT NULL DEFAULT '',
       source        TEXT NOT NULL DEFAULT 'file',  -- vscode | oauth | manual | file（旧数据迁移）
       added_by      TEXT NOT NULL DEFAULT 'file',  -- 添加方式：vscode(解析导入) | oauth(网页登录) | manual(手工导入) | migrate(旧 session 迁移)
@@ -219,10 +222,10 @@ function getDb() {
       updated_at  INTEGER NOT NULL DEFAULT 0
     );
 
-    -- 账号池配置（单行：version=2 固定），mode/strategy/pinnedId/cursor 存为 JSON
+    -- 账号池配置（按渠道一行），mode/strategy/pinnedId/cursor 存为 JSON
     CREATE TABLE IF NOT EXISTS account_pool (
-      id      INTEGER PRIMARY KEY CHECK (id = 1),
-      config  TEXT NOT NULL DEFAULT '{}',
+      provider   TEXT PRIMARY KEY,
+      config     TEXT NOT NULL DEFAULT '{}',
       updated_at INTEGER NOT NULL DEFAULT 0
     );
 
@@ -291,8 +294,84 @@ function getDb() {
       db.exec("ALTER TABLE accounts ADD COLUMN auto_checkin INTEGER NOT NULL DEFAULT 1");
     }
   } catch { /* 表不存在或已就绪则忽略 */ }
+  // 兼容旧库：多渠道改版新增 provider 列，旧数据一律归为 codebuddy
+  try {
+    const cols = db.prepare("PRAGMA table_info(accounts)").all().map((c) => c.name);
+    if (!cols.includes('provider')) {
+      db.exec("ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT 'codebuddy'");
+      db.exec('CREATE INDEX IF NOT EXISTS idx_accounts_provider ON accounts(provider)');
+    }
+  } catch { /* 忽略 */ }
+  try {
+    const cols = db.prepare("PRAGMA table_info(models)").all().map((c) => c.name);
+    if (!cols.includes('provider')) {
+      db.exec("ALTER TABLE models ADD COLUMN provider TEXT NOT NULL DEFAULT 'codebuddy'");
+    }
+  } catch { /* 忽略 */ }
+  migrateModelsToCompositeKey();
+  migrateAccountPoolToPerProvider();
   scheduleLogPrune();
   return db;
+}
+
+/**
+ * 旧版 models 表主键为 id 单列，多渠道后需改为 (provider, id) 复合主键，
+ * 否则两家同名模型（如 glm-5.2）会互相覆盖。SQLite 无法改主键，故重建表并搬数据。
+ */
+function migrateModelsToCompositeKey() {
+  try {
+    const info = db.prepare('PRAGMA table_info(models)').all();
+    const pkCols = info.filter((c) => c.pk > 0).map((c) => c.name).sort();
+    const composite = pkCols.length === 2 && pkCols[0] === 'id' && pkCols[1] === 'provider';
+    if (composite) return;
+    if (!info.some((c) => c.name === 'provider')) return; // 列还没补上，交给上一段处理
+    db.exec('ALTER TABLE models RENAME TO models_v1');
+    db.exec(`
+      CREATE TABLE models (
+        id               TEXT NOT NULL,
+        provider         TEXT NOT NULL DEFAULT 'codebuddy',
+        name             TEXT NOT NULL,
+        max_input_tokens  INTEGER NOT NULL DEFAULT 0,
+        max_output_tokens INTEGER NOT NULL DEFAULT 0,
+        tools            INTEGER NOT NULL DEFAULT 0,
+        vision           INTEGER NOT NULL DEFAULT 0,
+        reasoning        INTEGER NOT NULL DEFAULT 0,
+        region           TEXT NOT NULL DEFAULT 'cn',
+        created_at       INTEGER NOT NULL,
+        PRIMARY KEY (provider, id)
+      );
+    `);
+    db.exec(`
+      INSERT INTO models(id, provider, name, max_input_tokens, max_output_tokens, tools, vision, reasoning, region, created_at)
+      SELECT id, COALESCE(NULLIF(provider, ''), 'codebuddy'), name, max_input_tokens, max_output_tokens, tools, vision, reasoning, region, created_at
+      FROM models_v1
+    `);
+    db.exec('DROP TABLE models_v1');
+  } catch { /* 已迁移或表结构不符则忽略 */ }
+}
+
+/**
+ * 旧版账号池配置是单行（id=1），多渠道后需按渠道隔离。
+ * 迁移策略：把原单行配置整体挪给 codebuddy（保留用户既有 pinned/cursor 语义），
+ * 其余渠道首次使用时落默认值。
+ */
+function migrateAccountPoolToPerProvider() {
+  try {
+    const cols = db.prepare('PRAGMA table_info(account_pool)').all().map((c) => c.name);
+    if (!cols.includes('provider')) {
+      db.exec('ALTER TABLE account_pool RENAME TO account_pool_v1');
+      db.exec(`
+        CREATE TABLE account_pool (
+          provider   TEXT PRIMARY KEY,
+          config     TEXT NOT NULL DEFAULT '{}',
+          updated_at INTEGER NOT NULL DEFAULT 0
+        );
+      `);
+      db.exec(`INSERT INTO account_pool(provider, config, updated_at)
+               SELECT 'codebuddy', config, updated_at FROM account_pool_v1 WHERE id = 1`);
+      db.exec('DROP TABLE account_pool_v1');
+    }
+  } catch { /* 已迁移或表结构不符则忽略 */ }
 }
 
 function asBool(v, fallback = false) {
@@ -519,9 +598,12 @@ function validateModelInput(body) {
   if (!name) return { error: 'model name 不能为空' };
   const num = (v) => { const n = parseInt(v, 10); return Number.isFinite(n) && n >= 0 ? n : 0; };
   const bool = (v) => v === true || v === 'true' || v === 1 || v === '1';
+  // provider 决定模型归属渠道；未知值一律回落到默认渠道
+  const provider = (typeof body.provider === 'string' && body.provider.trim()) ? body.provider.trim() : 'codebuddy';
   return {
     model: {
       id,
+      provider,
       name,
       maxInputTokens: num(body.maxInputTokens),
       maxOutputTokens: num(body.maxOutputTokens),
@@ -539,20 +621,23 @@ function addModel(body) {
   if (error) return { error };
   const d = getDb();
   d.prepare(
-    'INSERT INTO models(id, name, max_input_tokens, max_output_tokens, tools, vision, reasoning, region, created_at) ' +
-    'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
-    'ON CONFLICT(id) DO UPDATE SET name=excluded.name, max_input_tokens=excluded.max_input_tokens, ' +
+    'INSERT INTO models(id, provider, name, max_input_tokens, max_output_tokens, tools, vision, reasoning, region, created_at) ' +
+    'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
+    'ON CONFLICT(provider, id) DO UPDATE SET name=excluded.name, max_input_tokens=excluded.max_input_tokens, ' +
     'max_output_tokens=excluded.max_output_tokens, tools=excluded.tools, vision=excluded.vision, ' +
     'reasoning=excluded.reasoning, region=excluded.region'
-  ).run(model.id, model.name, model.maxInputTokens, model.maxOutputTokens,
+  ).run(model.id, model.provider, model.name, model.maxInputTokens, model.maxOutputTokens,
         model.tools ? 1 : 0, model.vision ? 1 : 0, model.reasoning ? 1 : 0, model.region, model.createdAt);
   return { model };
 }
 
-function listModels() {
-  const rows = getDb().prepare('SELECT * FROM models ORDER BY created_at ASC, id ASC').all();
+function listModels(provider) {
+  const rows = provider
+    ? getDb().prepare('SELECT * FROM models WHERE provider = ? ORDER BY created_at ASC, id ASC').all(provider)
+    : getDb().prepare('SELECT * FROM models ORDER BY created_at ASC, id ASC').all();
   return rows.map((r) => ({
     id: r.id,
+    provider: r.provider || 'codebuddy',
     name: r.name,
     maxInputTokens: r.max_input_tokens,
     maxOutputTokens: r.max_output_tokens,
@@ -564,18 +649,22 @@ function listModels() {
   }));
 }
 
-function removeModel(id) {
+function removeModel(id, provider) {
   if (!id) return { error: 'model id 不能为空' };
   const d = getDb();
-  const r = d.prepare('DELETE FROM models WHERE id = ?').run(id);
+  const r = provider
+    ? d.prepare('DELETE FROM models WHERE id = ? AND provider = ?').run(id, provider)
+    : d.prepare('DELETE FROM models WHERE id = ?').run(id);
   return { deleted: r.changes > 0 };
 }
 
-function getModel(id) {
-  const r = getDb().prepare('SELECT * FROM models WHERE id = ?').get(id);
+function getModel(id, provider) {
+  const r = provider
+    ? getDb().prepare('SELECT * FROM models WHERE id = ? AND provider = ?').get(id, provider)
+    : getDb().prepare('SELECT * FROM models WHERE id = ?').get(id);
   if (!r) return null;
   return {
-    id: r.id, name: r.name,
+    id: r.id, provider: r.provider || 'codebuddy', name: r.name,
     maxInputTokens: r.max_input_tokens, maxOutputTokens: r.max_output_tokens,
     tools: !!r.tools, vision: !!r.vision, reasoning: !!r.reasoning, region: r.region,
   };
@@ -983,6 +1072,7 @@ function safeParseJson(s, fallback) {
 function accountRowToObject(r) {
   return {
     id: r.id,
+    provider: r.provider || 'codebuddy',
     name: r.name || '',
     source: r.source || 'file',
     addedBy: r.added_by || 'file',
@@ -998,9 +1088,19 @@ function accountRowToObject(r) {
 }
 
 /** 列出账号池全部账号（按创建时间升序，保持旧 session 数组顺序语义） */
-function listAccountRows() {
-  const rows = getDb().prepare('SELECT * FROM accounts ORDER BY created_at ASC, id ASC').all();
+function listAccountRows(provider) {
+  const rows = provider
+    ? getDb().prepare('SELECT * FROM accounts WHERE provider = ? ORDER BY created_at ASC, id ASC').all(provider)
+    : getDb().prepare('SELECT * FROM accounts ORDER BY created_at ASC, id ASC').all();
   return rows.map(accountRowToObject);
+}
+
+/** 按渠道统计账号数：{ codebuddy: n, traework: m } */
+function accountCountByProvider() {
+  const rows = getDb().prepare('SELECT provider, COUNT(*) AS n FROM accounts GROUP BY provider').all();
+  const out = {};
+  for (const r of rows) out[r.provider || 'codebuddy'] = r.n;
+  return out;
 }
 
 function getAccountRow(id) {
@@ -1011,11 +1111,12 @@ function getAccountRow(id) {
 
 /**
  * 新增账号（持久化到 accounts 表）。
- * acct: { id?, name?, source?, addedBy?, account?, auth?, accounts?, lastUsedAt?, useCount?, createdAt? }
+ * acct: { id?, provider?, name?, source?, addedBy?, account?, auth?, accounts?, lastUsedAt?, useCount?, createdAt? }
  */
 function insertAccount(acct) {
   if (!acct || typeof acct !== 'object') return null;
   const id = acct.id || ('acct_' + crypto.randomBytes(12).toString('hex'));
+  const provider = String(acct.provider || 'codebuddy');
   const name = String(acct.name || '');
   const source = String(acct.source || 'file');
   const addedBy = String(acct.addedBy || source || 'file');
@@ -1026,20 +1127,20 @@ function insertAccount(acct) {
   const createdAt = Number(acct.createdAt) || Date.now();
   const now = Date.now();
   getDb().prepare(
-    'INSERT INTO accounts(id, name, source, added_by, account, auth, accounts, auto_checkin, last_used_at, use_count, created_at, updated_at) ' +
-    'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
+    'INSERT INTO accounts(id, provider, name, source, added_by, account, auth, accounts, auto_checkin, last_used_at, use_count, created_at, updated_at) ' +
+    'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
     'ON CONFLICT(id) DO UPDATE SET ' +
-    'name=excluded.name, source=excluded.source, added_by=excluded.added_by, ' +
+    'provider=excluded.provider, name=excluded.name, source=excluded.source, added_by=excluded.added_by, ' +
     'account=excluded.account, auth=excluded.auth, accounts=excluded.accounts, auto_checkin=excluded.auto_checkin, ' +
     'last_used_at=excluded.last_used_at, use_count=excluded.use_count, updated_at=excluded.updated_at'
   ).run(
-    id, name, source, addedBy,
+    id, provider, name, source, addedBy,
     JSON.stringify(account), JSON.stringify(auth), JSON.stringify(accounts),
     autoCheckin ? 1 : 0,
     Number(acct.lastUsedAt) || 0, Number(acct.useCount) || 0, createdAt, now
   );
   // 不做写后读回：读回会多一次 SELECT + 全字段 JSON.parse，纯浪费（内存态以 session.js 为准）
-  return { id, name, source, addedBy, account, auth, accounts, autoCheckin, lastUsedAt: Number(acct.lastUsedAt) || 0, useCount: Number(acct.useCount) || 0, createdAt };
+  return { id, provider, name, source, addedBy, account, auth, accounts, autoCheckin, lastUsedAt: Number(acct.lastUsedAt) || 0, useCount: Number(acct.useCount) || 0, createdAt };
 }
 
 /** 轻量触碰：仅更新账号的使用时间与次数（单行 UPDATE）。供每请求的 markUsed 调用，避免全量池重写。 */
@@ -1049,15 +1150,16 @@ function touchAccount(id, lastUsedAt, useCount) {
     .run(Number(lastUsedAt) || 0, Number(useCount) || 0, Date.now(), id);
 }
 
-/** 更新账号（按 id），patch 支持 name / auth / account / source / addedBy / lastUsedAt / useCount */
+/** 更新账号（按 id），patch 支持 provider / name / auth / account / source / addedBy / lastUsedAt / useCount */
 function updateAccountRow(id, patch) {
   if (!id || !patch || typeof patch !== 'object') return getAccountRow(id);
   const existing = getAccountRow(id);
   if (!existing) return null;
   const next = Object.assign({}, existing, patch);
   getDb().prepare(
-    'UPDATE accounts SET name=?, source=?, added_by=?, account=?, auth=?, accounts=?, auto_checkin=?, last_used_at=?, use_count=?, updated_at=? WHERE id=?'
+    'UPDATE accounts SET provider=?, name=?, source=?, added_by=?, account=?, auth=?, accounts=?, auto_checkin=?, last_used_at=?, use_count=?, updated_at=? WHERE id=?'
   ).run(
+    String(next.provider || 'codebuddy'),
     String(next.name || ''),
     String(next.source || 'file'),
     String(next.addedBy || next.source || 'file'),
@@ -1082,27 +1184,42 @@ function accountCount() {
   return getDb().prepare('SELECT COUNT(*) AS n FROM accounts').get().n;
 }
 
-/* ---- 账号池配置（单行存储，version=2 固定） ---- */
+/* ---- 账号池配置（按渠道存储，version=2 固定） ---- */
 
 function defaultPoolConfig() {
   return { version: 2, pool: { mode: 'pool', strategy: 'round-robin', pinnedId: null, cursor: 0 } };
 }
 
-function getAccountPool() {
-  const r = getDb().prepare("SELECT config FROM account_pool WHERE id = 1").get();
+/** 读取指定渠道的账号池配置；provider 省略时用默认渠道（向后兼容旧调用） */
+function getAccountPool(provider) {
+  const kind = provider || 'codebuddy';
+  const r = getDb().prepare('SELECT config FROM account_pool WHERE provider = ?').get(kind);
   if (!r) return defaultPoolConfig();
   const cfg = safeParseJson(r.config, null);
   if (!cfg || typeof cfg !== 'object') return defaultPoolConfig();
   return Object.assign(defaultPoolConfig(), cfg);
 }
 
-function setAccountPool(config) {
+function setAccountPool(config, provider) {
+  const kind = provider || 'codebuddy';
   const cfg = config && typeof config === 'object' ? config : defaultPoolConfig();
   const now = Date.now();
   getDb().prepare(
-    'INSERT INTO account_pool(id, config, updated_at) VALUES(1, ?, ?) ON CONFLICT(id) DO UPDATE SET config=excluded.config, updated_at=excluded.updated_at'
-  ).run(JSON.stringify(cfg), now);
-  return getAccountPool();
+    'INSERT INTO account_pool(provider, config, updated_at) VALUES(?, ?, ?) ' +
+    'ON CONFLICT(provider) DO UPDATE SET config=excluded.config, updated_at=excluded.updated_at'
+  ).run(kind, JSON.stringify(cfg), now);
+  return getAccountPool(kind);
+}
+
+/** 列出全部渠道的账号池配置：{ codebuddy: {...}, traework: {...} } */
+function listAccountPools() {
+  const rows = getDb().prepare('SELECT provider, config FROM account_pool').all();
+  const out = {};
+  for (const r of rows) {
+    const cfg = safeParseJson(r.config, null);
+    out[r.provider] = (cfg && typeof cfg === 'object') ? Object.assign(defaultPoolConfig(), cfg) : defaultPoolConfig();
+  }
+  return out;
 }
 
 /* ============================ 自动每日签到状态 ============================ */
@@ -1374,8 +1491,9 @@ function setAutoCheckinEnabled(on) {
 
 module.exports = {
   // 账号池（登录态已迁移到 SQLite）
-  listAccountRows, getAccountRow, insertAccount, updateAccountRow, deleteAccountRow, accountCount, touchAccount,
-  getAccountPool, setAccountPool, defaultPoolConfig,
+  listAccountRows, getAccountRow, insertAccount, updateAccountRow, deleteAccountRow, accountCount,
+  accountCountByProvider, touchAccount,
+  getAccountPool, setAccountPool, listAccountPools, defaultPoolConfig,
 
   // 自动每日签到状态
   getCheckinState, listCheckinStates, setCheckinState, deleteCheckinState,

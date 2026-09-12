@@ -27,30 +27,16 @@ function authPath(sub) { return config.ENDPOINT + '/v2' + config.PREFIX_PATH + s
 
 function isExpiring(auth) { return sessionMod.isExpiringAuth(auth); }
 
-/** 刷新指定账号的 token，并写回池 */
+/** 刷新指定账号的 token，并写回池（按账号所属渠道分发） */
 async function refreshToken(acct) {
-  if (!acct || !acct.auth || !acct.auth.refreshToken) throw new Error('无 refreshToken，需要重新登录');
-  const headers = {
-    'X-Refresh-Token': acct.auth.refreshToken,
-    'X-Auth-Refresh-Source': 'plugin',
-    'X-Domain': acct.auth.domain || config.ENDPOINT_HOST,
-    'Content-Type': 'application/json',
-    'User-Agent': 'CodeBuddy-Proxy/1.0',
-  };
-  const r = await util.requestJson(authPath('/auth/token/refresh'), { method: 'POST', headers, body: {}, timeoutMs: 30000 });
-  const data = r.json && r.json.data;
-  if (r.json && r.json.code === 0 && data && data.accessToken) {
-    const oldAuth = acct.auth;
-    data.lastRefreshTime = Date.now();
-    if (!data.expiresAt && data.expiresIn) data.expiresAt = Date.now() + data.expiresIn * 1000;
-    if (!data.refreshToken) data.refreshToken = oldAuth.refreshToken;
-    if (!data.domain) data.domain = oldAuth.domain;
-    acct.auth = data;
-    sessionMod.updateAccount(acct.id, { auth: data });
-    logger.log('info', 'auth', 'accessToken 已刷新: ' + (acct.name || acct.account.uid));
-    return acct.auth;
-  }
-  throw new Error('刷新 token 失败: ' + (r.json ? (r.json.msg || r.json.code) : r.body));
+  if (!acct) throw new Error('账号不存在');
+  const provider = require('./providers/all').getProvider(acct.provider || 'codebuddy');
+  if (!provider || typeof provider.refreshToken !== 'function') throw new Error('该渠道不支持刷新 token');
+  const next = await provider.refreshToken(acct);
+  if (!next || !next.accessToken) throw new Error('刷新 token 失败：上游未返回 accessToken');
+  acct.auth = next;
+  sessionMod.updateAccount(acct.id, { auth: next });
+  return acct.auth;
 }
 
 /** 校验并（必要时）刷新某个账号，返回该账号对象 */
@@ -74,22 +60,33 @@ async function getValidSession() {
 /**
  * 根据请求选择账号并校验。
  * 优先级：header/body 显式指定 > 关闭池模式（pinned 强制账号）> 密钥绑定账号 > 账号池。
+ * provider：目标渠道，仅在该渠道的账号中挑选（默认 codebuddy，保持旧行为）。
  * @param {string} [explicitKey] 来自 header/body 的显式账号指定
  * @param {string} [keyAccountId] API 密钥绑定的账号 id（空 = 未绑定）
+ * @param {string} [provider] 渠道标识
  */
-async function pickAccountForRequest(explicitKey, keyAccountId) {
-  const pool = sessionMod.getPoolConfig();
+async function pickAccountForRequest(explicitKey, keyAccountId, provider) {
+  const kind = provider || 'codebuddy';
+  const pool = sessionMod.getPoolConfig(kind);
+  // 候选账号必须属于目标渠道，避免拿 A 渠道账号去请求 B 渠道
+  const inKind = (a) => !!a && (a.provider || 'codebuddy') === kind;
   let acct = null;
   if (explicitKey) {
-    acct = sessionMod.findAccountByIdOrName(explicitKey);
+    const found = sessionMod.findAccountByIdOrName(explicitKey);
+    acct = inKind(found) ? found : null;
   } else if (pool.mode === 'pinned' && pool.pinnedId) {
-    acct = sessionMod.getAccount(pool.pinnedId);
+    const pinned = sessionMod.getAccount(pool.pinnedId);
+    acct = inKind(pinned) ? pinned : null;
   } else if (keyAccountId) {
-    acct = sessionMod.findAccountByIdOrName(keyAccountId);
+    const bound = sessionMod.findAccountByIdOrName(keyAccountId);
+    acct = inKind(bound) ? bound : null;
   } else {
-    acct = sessionMod.pickAccount(null);
+    acct = sessionMod.pickAccount(null, kind);
   }
-  if (!acct) throw new Error('未登录，请先打开管理页登录');
+  if (!acct) {
+    const label = require('./providers/all').labelOf(kind);
+    throw new Error(`渠道「${label}」没有可用账号，请先在管理页登录`);
+  }
   const valid = await getValidAccount(acct);
   sessionMod.markUsed(valid.id);
   return valid;
