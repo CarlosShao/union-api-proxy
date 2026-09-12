@@ -46,6 +46,12 @@ function normalizeSession(data) {
       refreshExpiresIn: auth.refreshExpiresIn || 0,
       refreshExpiresAt: auth.refreshExpiresAt || 0,
       lastRefreshTime: auth.lastRefreshTime || Date.now(),
+      // 渠道专有字段：白名单式归一化会把它们丢掉，导致上游设备指纹缺失
+      // （Trae 签到/额度接口校验 x-device-id，缺失会以 1001 拒绝）
+      apiHost: auth.apiHost || '',
+      machineId: auth.machineId || '',
+      deviceId: auth.deviceId || '',
+      enterpriseId: auth.enterpriseId || '',
     },
     accounts: data.accounts || [],
   };
@@ -339,12 +345,6 @@ function updateAccount(id, patch) {
     if (patch.useCount != null) acct.useCount = patch.useCount;
     if (patch.source) acct.source = patch.source;
     if (patch.addedBy) acct.addedBy = patch.addedBy;
-    // auth 可能带 Trae 专有的 machineId/deviceId/apiHost，normalizeSession 会丢掉，需补回
-    if (patch.auth && typeof patch.auth === 'object') {
-      for (const k of ['machineId', 'deviceId', 'apiHost']) {
-        if (patch.auth[k] !== undefined) acct.auth[k] = patch.auth[k];
-      }
-    }
   }
   // 单行同步落库（微秒级）：token 刷新等场景不再触发 500ms 后的全量池重写（那会在流式响应中途阻塞事件循环）
   try {

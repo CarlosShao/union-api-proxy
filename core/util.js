@@ -217,8 +217,6 @@ function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, bod
           resolve();
         });
         upRes.on('error', (e) => { status = 'error'; report(); reject(e); });
-        if (payload != null) upstream.write(payload);
-        upstream.end();
         return;
       }
 

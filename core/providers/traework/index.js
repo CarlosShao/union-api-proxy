@@ -27,9 +27,21 @@ function preparePayload(payload) {
   return client.buildChatBody(payload);
 }
 
+/**
+ * 统一构造「上游所需」的账号视图。
+ * 调用方可能传账号对象（{account, auth}），也可能直接传 auth。
+ * 上游各接口既需要 accessToken（Authorization / X-Cloudide-Token），
+ * 也需要 uid（X-Uid 头），因此统一扁平化成 client 层期望的形状。
+ */
+function toUpstreamAccount(acct) {
+  if (!acct) return { account: {} };
+  if (acct.auth) return Object.assign({}, acct.auth, { account: acct.account || {} });
+  return Object.assign({ account: {} }, acct);
+}
+
 /** 聊天请求头（含设备指纹；Accept 必须为 text/event-stream） */
 function buildChatHeaders(acct) {
-  return SOLOHeaders(acct && acct.auth ? acct.auth : {}, { stream: true });
+  return SOLOHeaders(toUpstreamAccount(acct), { stream: true });
 }
 
 function chatUrl() {
@@ -52,13 +64,9 @@ function createSseConverter() {
   return sse.createSseConverter();
 }
 
-/**
- * 动态模型列表；失败时抛出，由调用方回退到 staticModels()。
- * 签名对齐 Provider 接口：传入账号对象（含 auth）。
- */
+/** 动态模型列表；失败时抛出，由调用方回退到 staticModels() */
 async function listModels(acct) {
-  const auth = acct && acct.auth ? acct.auth : acct;
-  return client.listModels({ auth, account: (acct && acct.account) || {} });
+  return client.listModels(toUpstreamAccount(acct));
 }
 
 function classifyError(status, body) {
@@ -66,19 +74,19 @@ function classifyError(status, body) {
 }
 
 function checkin(accountId, acct) {
-  return client.checkin(acct);
+  return client.checkin(toUpstreamAccount(acct));
 }
 
 function checkinStatus(accountId, acct) {
-  return client.checkinStatus(acct);
+  return client.checkinStatus(toUpstreamAccount(acct));
 }
 
 function credits(accountId, acct) {
-  return client.credits(acct);
+  return client.credits(toUpstreamAccount(acct));
 }
 
 function creditDetail(accountId, acct) {
-  return client.creditDetail(acct);
+  return client.creditDetail(toUpstreamAccount(acct));
 }
 
 module.exports = {
