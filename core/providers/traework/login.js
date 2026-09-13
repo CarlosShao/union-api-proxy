@@ -33,6 +33,9 @@ function randNumericId() {
   return s;
 }
 
+/** 32 字节十六进制 machineId（与官方客户端 telemetry machineId 同形） */
+function randMachineId() { return randHex(32); }
+
 /** PKCE：code_verifier 需与登录 URL 配对保存，换 AuthCode 时回传 */
 function genPKCE() {
   const verifier = crypto.randomBytes(48).toString('base64url');
@@ -350,4 +353,4 @@ function cancel(state) {
   pending.delete(state);
 }
 
-module.exports = { start, status, cancel, parseCallback, buildAuthUrl, genPKCE, pending };
+module.exports = { start, status, cancel, parseCallback, buildAuthUrl, genPKCE, pending, randNumericId, randMachineId };

@@ -38,6 +38,10 @@ module.exports = {
   EpUserInfo: '/cloudide/api/v3/trae/GetUserInfo',
   EpCheckinStatus: '/trae/api/v2/ug/checkin_credits/status',
   EpCheckinClaim: '/trae/api/v2/ug/checkin_credits/claim',
+  // 签到接口 body 携带字段（逆向官方客户端 _requestCheckinCredits：POST body 为 { req_source }；
+  // SOLO 系 packageType 取 2，经典 TRAE_CN 取 1）。实测 9004 的根因是缺失 x-device-id 请求头，
+  // body 是否携带不影响结果；带上只为与官方客户端完全一致。
+  CheckinReqSource: 1,
   EpEntUsage: '/trae/api/v2/pay/web_user_ent_usage',
   EpModelsPricing: '/api/remote/v1/models', // 模型定价表（含 batch 场景表尚未放行的新模型）
 

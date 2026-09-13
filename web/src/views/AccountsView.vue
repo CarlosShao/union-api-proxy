@@ -182,7 +182,14 @@ function todayUsedText(acct) {
 
 async function setMode(v) {
   try {
-    const r = await api.setPool({ mode: v, provider: activeChannel.value });
+    // 切到指定账号时自动选中当前 pin 的账号（无则选第一个），
+    // 避免 pinnedId 为空时指定模式静默回退成轮询
+    let pinnedId = pool.value.pinnedId;
+    if (v === 'pinned' && !pinnedId) {
+      const first = channelAccounts.value[0];
+      if (first) pinnedId = first.id;
+    }
+    const r = await api.setPool(pinnedId ? { mode: v, pinnedId, provider: activeChannel.value } : { mode: v, provider: activeChannel.value });
     pool.value = r;
     notice.value = '';
   } catch (e) {

@@ -50,11 +50,23 @@ function preparePayload(payload) {
  * 调用方可能传账号对象（{account, auth}），也可能直接传 auth。
  * 上游各接口既需要 accessToken（Authorization / X-Cloudide-Token），
  * 也需要 uid（X-Uid 头），因此统一扁平化成 client 层期望的形状。
+ *
+ * deviceId / machineId 缺失时补生成并回填到池：官方客户端签到/额度接口
+ * 用 guaranteedDeviceId 保证 x-device-id 必发（缺失以 9004 拒绝 claim），
+ * 对话接口同样携带。存量账号（早期登录/导入）可能没有这两个字段。
  */
 function toUpstreamAccount(acct) {
   if (!acct) return { account: {} };
-  if (acct.auth) return Object.assign({}, acct.auth, { account: acct.account || {} });
-  return Object.assign({ account: {} }, acct);
+  const base = acct.auth
+    ? Object.assign({}, acct.auth, { account: acct.account || {} })
+    : Object.assign({ account: {} }, acct);
+  if (!base.deviceId) base.deviceId = login.randNumericId();
+  if (!base.machineId) base.machineId = login.randMachineId();
+  if (acct.auth && acct.id && (base.deviceId !== acct.auth.deviceId || base.machineId !== acct.auth.machineId)) {
+    const patch = { auth: Object.assign({}, acct.auth, { deviceId: base.deviceId, machineId: base.machineId }) };
+    try { require('../../session').updateAccount(acct.id, patch); } catch (e) { /* 回填失败不影响本次请求 */ }
+  }
+  return base;
 }
 
 /** 聊天请求头（含设备指纹；Accept 必须为 text/event-stream） */

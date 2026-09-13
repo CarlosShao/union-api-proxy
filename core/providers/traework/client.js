@@ -290,7 +290,7 @@ async function fetchPricingModels(acct) {
 /** 签到状态：{ checkedIn, credits, enable } */
 async function checkinStatus(acct) {
   const r = await util.requestJson(C.UgHost + C.EpCheckinStatus, {
-    method: 'POST', headers: UgHeaders(acct), body: {}, timeoutMs: 30000,
+    method: 'POST', headers: UgHeaders(acct), body: { req_source: C.CheckinReqSource }, timeoutMs: 30000,
   });
   const d = r.json;
   if (!d) throw new Error('签到状态查询失败: ' + r.body);
@@ -306,7 +306,7 @@ async function checkinStatus(acct) {
 async function checkinClaim(acct, { retryDelayMs = 8000 } = {}) {
   for (let attempt = 0; attempt < 2; attempt++) {
     const r = await util.requestJson(C.UgHost + C.EpCheckinClaim, {
-      method: 'POST', headers: UgHeaders(acct), body: {}, timeoutMs: 30000,
+      method: 'POST', headers: UgHeaders(acct), body: { req_source: C.CheckinReqSource }, timeoutMs: 30000,
     });
     const d = r.json;
     if (!d) throw new Error('签到失败: ' + r.body);
