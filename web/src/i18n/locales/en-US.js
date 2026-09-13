@@ -321,6 +321,7 @@ export default {
     colName: 'Name',
     colNickname: 'Nickname',
     colUsed: 'Usage',
+    colOps: 'Actions',
     empty: 'No accounts yet. Click "Add account" to sign in your first OAuth account',
     renamePrompt: 'Set a name for this account',
     confirmDelete: 'Delete account "{name}"?',

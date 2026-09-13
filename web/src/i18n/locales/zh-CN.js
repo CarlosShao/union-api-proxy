@@ -321,6 +321,7 @@ export default {
     colName: '名称',
     colNickname: '昵称',
     colUsed: '使用情况',
+    colOps: '操作',
     empty: '还没有账号，点击右上角「添加账号」登录第一个 OAuth 账号',
     renamePrompt: '为该账号设置名称',
     confirmDelete: '确认删除账号「{name}」？',

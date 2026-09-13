@@ -342,7 +342,10 @@ async function remove(acct) {
 
 function fmt(ms) {
   if (!ms) return '-';
-  return new Date(ms).toLocaleString();
+  // 紧凑格式（去秒）：长格式会把 Token 过期/使用情况两列撑宽，窄视口下表格溢出
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}/${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 function sourceText(s) {
@@ -436,7 +439,7 @@ load();
               <th>{{ t('accounts.colUsed') }}</th>
               <th>{{ t('accounts.credits') }}</th>
               <th>{{ t('accounts.checkin') }}</th>
-              <th></th>
+              <th class="ops-th">{{ t('accounts.colOps') }}</th>
             </tr>
           </thead>
           <tbody>
@@ -452,11 +455,8 @@ load();
               <td class="muted">{{ a.useCount }} / {{ fmt(a.lastUsedAt) }}</td>
               <td class="credits-cell">
                 <template v-if="creditsText(a)">
-                  <div class="credits-value">{{ creditsText(a) }}</div>
-                  <div class="credits-today" v-if="todayUsedText(a) !== '-'">
-                    {{ t('accounts.todayUsed') }}：<b>{{ todayUsedText(a) }}</b>
-                  </div>
-                  <div class="credits-today" v-else>{{ t('accounts.todayUsed') }}：-</div>
+                  <span class="credits-value">{{ creditsText(a) }}</span>
+                  <span class="credits-today">（{{ t('accounts.todayUsed') }} <b>{{ todayUsedText(a) }}</b>）</span>
                 </template>
                 <span v-else class="muted">{{ creditsLoading ? t('common.loading') : '-' }}</span>
               </td>
@@ -562,9 +562,21 @@ load();
 }
 .tip:hover .tip-text { visibility: visible; opacity: 1; }
 .table-wrap { overflow-x: auto; }
+/* 单元格文本不换行：昵称/来源等被挤压竖排会撑高行高，操作列垂直居中后上下留出大片空白。
+   UID 列例外 —— 允许缩窄并以省略号截断，避免长 UUID 把表格撑出横向滚动。 */
+.table td { vertical-align: middle; white-space: nowrap; }
+.table td code {
+  display: inline-block; max-width: 100px;
+  overflow: hidden; text-overflow: ellipsis;
+  vertical-align: middle; white-space: nowrap;
+}
+/* 紧凑内边距：给窄视口留出表格总宽余量 */
+.table th, .table td { padding: 9px 7px; }
+.ops .btn-sm { padding: 4px 7px; }
 tr.pinned td { background: var(--primary-soft); }
 .strong { font-weight: 600; }
-.ops { display: flex; gap: 6px; justify-content: flex-end; white-space: nowrap; }
+.ops { display: flex; gap: 4px; justify-content: flex-end; white-space: nowrap; }
+.ops-th { text-align: right; }
 .checkin-state { font-size: 12px; font-weight: 600; white-space: nowrap; }
 .checkin-state.done { color: var(--success, #3fb950); }
 .checkin-state.todo { color: var(--warning, #d29922); }
@@ -572,7 +584,7 @@ tr.pinned td { background: var(--primary-soft); }
 .checkin-state.error { color: var(--danger, #f85149); }
 .credits-cell { white-space: nowrap; }
 .credits-value { font-weight: 600; color: var(--text); }
-.credits-today { font-size: 12px; color: var(--text-2); margin-top: 2px; }
+.credits-today { font-size: 12px; color: var(--text-2); }
 .credits-today b { color: var(--warning, #d29922); font-weight: 600; }
 .btn-sm { padding: 4px 10px; font-size: 12px; }
 .add-card { margin-top: 16px; }

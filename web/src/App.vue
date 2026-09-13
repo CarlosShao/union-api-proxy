@@ -115,9 +115,17 @@ watch(pageTitle, (title) => {
 .content {
   flex: 1;
   padding: 24px 28px 40px;
-  max-width: 1120px;
+  /* 宽屏不限宽充分利用空间；中等屏限制上限避免行过长难读 */
   width: 100%;
-  margin: 0 auto;
+}
+@media (min-width: 1440px) {
+  .content { max-width: 1720px; }
+}
+@media (max-width: 1439px) and (min-width: 981px) {
+  .content { max-width: 1120px; margin: 0 auto; }
+}
+@media (max-width: 980px) {
+  .content { max-width: none; }
 }
 .build-banner {
   display: flex;
