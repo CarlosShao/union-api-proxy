@@ -260,6 +260,20 @@ function getDb() {
     );
     CREATE INDEX IF NOT EXISTS idx_rate_limits_scope ON rate_limits(scope);
 
+    -- 自定义 OpenAI 兼容 API（endpoint 整站接入，免登录、自带 key）
+    -- 用户在管理页配置一个 base URL + API Key，代理直接转发其 /chat/completions 等。
+    CREATE TABLE IF NOT EXISTS custom_apis (
+      id            TEXT PRIMARY KEY,
+      name          TEXT NOT NULL DEFAULT '',          -- 展示名
+      base_url      TEXT NOT NULL,                     -- 上游 base URL，如 https://openrouter.ai/api/v1
+      api_key       TEXT NOT NULL DEFAULT '',          -- 上游 API Key（明文存储，仅管理页可见）
+      model_prefix  TEXT NOT NULL DEFAULT 'oc',       -- 模型对外前缀；裸模型走此渠道需 prefix 区分，默认 oc
+      models        TEXT NOT NULL DEFAULT '',         -- 可选模型白名单（逗号分隔）；空 = 不限制（全放行）
+      enabled       INTEGER NOT NULL DEFAULT 1,        -- 是否启用
+      created_at    INTEGER NOT NULL,
+      updated_at    INTEGER NOT NULL DEFAULT 0
+    );
+
     -- 每日积分快照（按账号），每天 0 时记录一次 usageUsed/usageLeft/usageTotal，
     -- 用于计算「今日消耗」（当前 usageUsed - 今日 0 时快照 usageUsed）。
     CREATE TABLE IF NOT EXISTS credit_snapshots (
@@ -1480,6 +1494,122 @@ function pruneRateLimits() {
     .run(now, now - 24 * 3600 * 1000);
 }
 
+/* ============================ 自定义 OpenAI 兼容 API ============================ */
+
+/**
+ * 规范化 base URL：去掉尾随 /，保证拼接 /chat/completions 时不会出现双斜杠。
+ * 同时兼容用户填成 https://x.ai/v1 或 https://x.ai/api/v1 等形式。
+ */
+function normalizeBaseUrl(url) {
+  let s = String(url || '').trim();
+  if (!s) return '';
+  if (!/^https?:\/\//i.test(s)) s = 'https://' + s;
+  return s.replace(/\/+$/, '');
+}
+
+function validateCustomApiInput(body) {
+  if (!body || typeof body !== 'object') return { error: 'invalid body' };
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  const baseUrl = normalizeBaseUrl(body.baseUrl || body.base_url);
+  const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : (typeof body.api_key === 'string' ? body.api_key.trim() : '');
+  if (!baseUrl) return { error: 'base URL 不能为空' };
+  if (!/^https?:\/\//i.test(baseUrl)) return { error: 'base URL 非法' };
+  const prefix = (typeof body.modelPrefix === 'string' && body.modelPrefix.trim())
+    ? body.modelPrefix.trim().toLowerCase()
+    : 'oc';
+  if (!/^[a-z0-9_-]+$/.test(prefix)) return { error: '模型前缀仅允许字母、数字、_ -' };
+  // 模型白名单：逗号/空白分隔，去重去空
+  let models = '';
+  if (body.models) {
+    models = String(body.models).split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
+    const seen = new Set();
+    models = models.filter((m) => (seen.has(m) ? false : (seen.add(m), true))).join(',');
+  }
+  return {
+    model: {
+      name, baseUrl, apiKey,
+      modelPrefix: prefix,
+      models,
+      enabled: body.enabled === undefined ? true : (body.enabled === true || body.enabled === 'true' || body.enabled === 1 || body.enabled === '1'),
+    },
+  };
+}
+
+function customApiRowToObject(r) {
+  return {
+    id: r.id,
+    name: r.name || '',
+    baseUrl: r.base_url || '',
+    apiKey: r.api_key || '',
+    modelPrefix: r.model_prefix || 'oc',
+    models: r.models ? String(r.models).split(',').filter(Boolean) : [],
+    enabled: r.enabled === undefined ? true : !!r.enabled,
+    createdAt: r.created_at || 0,
+    updatedAt: r.updated_at || 0,
+  };
+}
+
+function listCustomApis() {
+  const rows = getDb().prepare('SELECT * FROM custom_apis ORDER BY created_at ASC, id ASC').all();
+  return rows.map(customApiRowToObject);
+}
+
+/** 按 id（或 modelPrefix）查一个自定义 endpoint。返回完整对象（含 apiKey），仅内部调用。 */
+function customApiById(idOrPrefix) {
+  if (!idOrPrefix) return null;
+  const r = getDb().prepare('SELECT * FROM custom_apis WHERE id = ?').get(idOrPrefix);
+  if (r) return customApiRowToObject(r);
+  const r2 = getDb().prepare('SELECT * FROM custom_apis WHERE model_prefix = ?').get(String(idOrPrefix).toLowerCase());
+  return r2 ? customApiRowToObject(r2) : null;
+}
+
+function getCustomApi(id) { return customApiById(id); }
+
+function addCustomApi(body) {
+  const { error, model } = validateCustomApiInput(body);
+  if (error) return { error };
+  const id = 'capi_' + crypto.randomBytes(10).toString('hex');
+  const now = Date.now();
+  getDb().prepare(
+    'INSERT INTO custom_apis(id, name, base_url, api_key, model_prefix, models, enabled, created_at, updated_at) ' +
+    'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, model.name, model.baseUrl, model.apiKey, model.modelPrefix, model.models, model.enabled ? 1 : 0, now, now);
+  return { api: customApiById(id) };
+}
+
+/**
+ * 更新自定义 endpoint。patch 支持 name / baseUrl / apiKey / modelPrefix / models / enabled。
+ * apiKey 为空字符串表示不更新（保留旧值）；传 null 可清空（一般不用）。
+ */
+function updateCustomApi(id, patch) {
+  const existing = customApiById(id);
+  if (!existing) return { error: '未找到该自定义 API' };
+  const next = Object.assign({}, existing, patch || {});
+  const baseUrl = normalizeBaseUrl(next.baseUrl);
+  if (!baseUrl) return { error: 'base URL 不能为空' };
+  const apiKey = (patch && 'apiKey' in patch)
+    ? (String(patch.apiKey).trim())
+    : existing.apiKey;
+  const prefix = (next.modelPrefix && String(next.modelPrefix).trim())
+    ? String(next.modelPrefix).trim().toLowerCase() : 'oc';
+  if (!/^[a-z0-9_-]+$/.test(prefix)) return { error: '模型前缀仅允许字母、数字、_ -' };
+  let models = next.models;
+  if (Array.isArray(models)) models = models.filter(Boolean).join(',');
+  else if (typeof models === 'string') models = String(models).split(/[,\s]+/).map((s) => s.trim()).filter(Boolean).join(',');
+  else models = existing.models.join(',');
+  const enabled = next.enabled === undefined ? existing.enabled : (next.enabled === true || next.enabled === 'true' || next.enabled === 1 || next.enabled === '1');
+  getDb().prepare(
+    'UPDATE custom_apis SET name=?, base_url=?, api_key=?, model_prefix=?, models=?, enabled=?, updated_at=? WHERE id=?'
+  ).run(next.name || '', baseUrl, apiKey, prefix, models, enabled ? 1 : 0, Date.now(), id);
+  return { api: customApiById(id) };
+}
+
+function removeCustomApi(id) {
+  const r = getDb().prepare('DELETE FROM custom_apis WHERE id = ?').run(id);
+  return { deleted: r.changes > 0 };
+}
+
+
 function autoCheckinEnabled() {
   return asBool(getConfig().autoCheckin, true);
 }
@@ -1525,4 +1655,8 @@ module.exports = {
 
   // 失败限流（持久化）
   rateLimitCheck, rateLimitRecordFailure, rateLimitReset, pruneRateLimits,
+
+  // 自定义 OpenAI 兼容 API
+  listCustomApis, addCustomApi, updateCustomApi, getCustomApi, removeCustomApi,
+  customApiById,
 };

@@ -40,6 +40,18 @@ function providerKinds() {
   return Array.from(registry.keys());
 }
 
+/**
+ * 自定义前缀解析器（动态）：供 openai-custom 渠道注册。
+ * 给定前缀串，返回它归属的 kind（'openai-custom'）或 null。
+ * 这样运行时新增/修改 endpoint 前缀时，resolveModel 无需重启即可识别。
+ */
+let customPrefixResolver = null;
+function setCustomPrefixResolver(fn) { customPrefixResolver = typeof fn === 'function' ? fn : null; }
+function resolveCustomPrefix(prefix) {
+  if (!customPrefixResolver || !prefix) return null;
+  try { return customPrefixResolver(String(prefix).toLowerCase()); } catch { return null; }
+}
+
 /** 默认渠道：无前缀模型归属此渠道。可用 UNION_DEFAULT_PROVIDER 覆盖。 */
 function defaultKind() {
   const k = process.env.UNION_DEFAULT_PROVIDER || process.env.CODEBUDDY_DEFAULT_PROVIDER || 'codebuddy';
@@ -75,6 +87,9 @@ function resolveModel(modelStr) {
       if (aliased && registry.has(aliased)) return { provider: aliased, kind: aliased, model: rest };
       // 内部 kind 直接作前缀的写法（codebuddy/traework）继续可用
       if (registry.has(lower)) return { provider: lower, kind: lower, model: rest };
+      // 自定义 OpenAI 兼容 endpoint 前缀（如 oc / 用户自定 / endpoint id），运行时动态解析
+      const customKind = resolveCustomPrefix(lower);
+      if (customKind && registry.has(customKind)) return { provider: customKind, kind: customKind, model: rest };
     }
   }
   return { provider: def, kind: def, model: cleaned };
@@ -126,6 +141,7 @@ function staticModelsByProvider() {
 module.exports = {
   register, getProvider, listProviders, providerKinds,
   defaultKind, resolveModel, labelOf, modelIdOf, externalPrefixOf, staticModelsByProvider,
+  setCustomPrefixResolver, resolveCustomPrefix,
 };
 
 /* ------------------------------------------------------------------

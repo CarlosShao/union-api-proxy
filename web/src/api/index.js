@@ -74,6 +74,13 @@ export const api = {
   dailyCheckin: (accountId) => alova.Post('/api/checkin', { accountId }),
   credits: (accountId) => alova.Get(withQuery('/api/credits', { accountId })),
 
+  // 自定义 OpenAI 兼容 API
+  listCustomApis: () => alova.Get('/api/custom-apis'),
+  addCustomApi: (payload) => alova.Post('/api/custom-apis', payload),
+  updateCustomApi: (id, patch) => alova.Put(`/api/custom-apis/${encodeURIComponent(id)}`, patch),
+  deleteCustomApi: (id) => alova.Delete(`/api/custom-apis/${encodeURIComponent(id)}`),
+  testCustomApi: (id) => alova.Post(`/api/custom-apis/${encodeURIComponent(id)}/test`),
+
   // 管理页鉴权
   adminStatus: () => alova.Get('/api/admin/status'),
   adminLogin: (payload) => alova.Post('/api/admin/login', payload),

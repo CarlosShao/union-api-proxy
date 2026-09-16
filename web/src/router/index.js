@@ -4,6 +4,7 @@ const routes = [
   { path: '/', redirect: '/home' },
   { path: '/home', name: 'overview', component: () => import('@/views/OverviewView.vue'), meta: { title: 'overview' } },
   { path: '/models', name: 'models', component: () => import('@/views/ModelsView.vue'), meta: { title: 'models' } },
+  { path: '/custom-apis', name: 'customApis', component: () => import('@/views/CustomApisView.vue'), meta: { title: 'customApis' } },
   { path: '/accounts', name: 'accounts', component: () => import('@/views/AccountsView.vue'), meta: { title: 'accounts' } },
   { path: '/logs', name: 'logs', component: () => import('@/views/LogsView.vue'), meta: { title: 'logs' } },
   { path: '/apikeys', name: 'apikeys', component: () => import('@/views/ApiKeysView.vue'), meta: { title: 'apikeys' } },

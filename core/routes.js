@@ -66,12 +66,16 @@ function statusObject() {
     pools[k].label = providers.labelOf(k);
   }
   const defaultKind = providers.defaultKind();
+  // 给客户端展示的地址：容器里 HOST=0.0.0.0 是监听用地址，客户端无法直接访问，
+  // 展示时回落为 127.0.0.1；可用 UNION_PUBLIC_HOST 覆盖（如域名/局域网 IP）。
+  const publicHost = process.env.UNION_PUBLIC_HOST
+    || (config.HOST === '0.0.0.0' || config.HOST === '::' ? '127.0.0.1' : config.HOST);
   return {
     loggedIn: sessionMod.isLoggedIn(),
     source: sessionMod.getSessionSource(),
     endpoint: config.ENDPOINT,
-    baseUrl: `http://${config.HOST}:${config.PORT}`,
-    openaiBaseUrl: `http://${config.HOST}:${config.PORT}/v1`,
+    baseUrl: `http://${publicHost}:${config.PORT}`,
+    openaiBaseUrl: `http://${publicHost}:${config.PORT}/v1`,
     // 兼容旧字段：默认渠道的池信息
     pool: Object.assign({}, sessionMod.getPoolConfig(defaultKind)),
     pools,
@@ -751,7 +755,13 @@ async function route(req, res) {
   if (pathname === '/v1/models') {
     const keyCheck = auth.verifyClientKey(req);
     if (!keyCheck.ok) { util.sendJson(res, keyCheck.rateLimited ? 429 : 401, { error: { message: keyCheck.message, type: 'authentication_error' } }); return; }
-    util.sendJson(res, 200, modelsResponseForLoggedInProviders());
+    // 异步刷新自定义 endpoint 上游 /models（fire-and-forget，不阻塞返回）
+    models.refreshCustomApiModels().catch(() => {});
+    const customProvider = providers.getProvider('openai-custom');
+    const base = modelsResponseForLoggedInProviders();
+    const extras = models.customApiModelEntries(store, customProvider);
+    base.data = base.data.concat(extras);
+    util.sendJson(res, 200, base);
     return;
   }
   if (pathname === '/models' && method === 'GET') {
@@ -759,13 +769,24 @@ async function route(req, res) {
     if (accept.includes('text/html')) { serveIndex(res); return; }
     const keyCheck = auth.verifyClientKey(req);
     if (!keyCheck.ok) { util.sendJson(res, keyCheck.rateLimited ? 429 : 401, { error: { message: keyCheck.message, type: 'authentication_error' } }); return; }
-    util.sendJson(res, 200, models.modelsResponse(store.listModels(), store.getHiddenModels(), modelCache.extraModelsForAllProviders()));
+    // 异步刷新自定义 endpoint 上游 /models（fire-and-forget，不阻塞返回）
+    models.refreshCustomApiModels().catch(() => {});
+    const customProvider = providers.getProvider('openai-custom');
+    const base = models.modelsResponse(store.listModels(), store.getHiddenModels(), modelCache.extraModelsForAllProviders());
+    base.data = base.data.concat(models.customApiModelEntries(store, customProvider));
+    util.sendJson(res, 200, base);
     return;
   }
 
   /* ---- 自定义模型管理 API ---- */
   if (pathname === '/api/models' && method === 'GET') {
-    util.sendJson(res, 200, { models: models.allModels(store.listModels(), store.getHiddenModels(), modelCache.extraModelsForAllProviders()) });
+    // 先刷新自定义 endpoint 的上游模型（带缓存，首次稍慢），再合并展示
+    await models.refreshCustomApiModels();
+    const all = models.allModels(store.listModels(), store.getHiddenModels(), modelCache.extraModelsForAllProviders());
+    // 合并自定义 OpenAI 兼容 endpoint 的模型（按 endpoint 维度归类到 openai-custom 渠道）
+    const customProvider = providers.getProvider('openai-custom');
+    const custom = models.customApiModelsForManage(store, customProvider);
+    util.sendJson(res, 200, { models: all.concat(custom) });
     return;
   }
   if (pathname === '/api/models' && method === 'POST') {
@@ -805,6 +826,81 @@ async function route(req, res) {
       util.sendJson(res, 200, { ok: true, id, hidden });
     } catch (e) {
       util.sendJson(res, 400, { error: { message: '更新模型隐藏状态失败: ' + e.message } });
+    }
+    return;
+  }
+
+  /* ---- 自定义 OpenAI 兼容 API 管理 ---- */
+  if (pathname === '/api/custom-apis' && method === 'GET') {
+    // 刷新上游模型（带缓存，首次稍慢），使列表里的模型计数准确
+    await models.refreshCustomApiModels();
+    const customProvider = providers.getProvider('openai-custom');
+    const list = store.listCustomApis().map((e) => {
+      const { apiKey, ...rest } = e;
+      const modelCount = (e.models && e.models.length)
+        ? e.models.length
+        : (customProvider && typeof customProvider.getCachedModelCount === 'function'
+          ? customProvider.getCachedModelCount(e.id) : 0);
+      return { ...rest, apiKeyMasked: apiKey ? (apiKey.length <= 8 ? '***' : apiKey.slice(0, 6) + '…' + apiKey.slice(-4)) : '', modelCount };
+    });
+    util.sendJson(res, 200, { apis: list });
+    return;
+  }
+  if (pathname === '/api/custom-apis' && method === 'POST') {
+    try {
+      const buf = await util.readBody(req);
+      const body = buf.length ? JSON.parse(buf.toString('utf8')) : {};
+      const r = store.addCustomApi(body);
+      if (r.error) { util.sendJson(res, 400, { error: { message: r.error } }); return; }
+      logger.log('info', 'config', `新增自定义 API: ${r.api.name} (${r.api.modelPrefix})`);
+      util.sendJson(res, 200, { api: r.api });
+    } catch (e) {
+      util.sendJson(res, 400, { error: { message: `新增自定义 API 失败: ${e.message}` } });
+    }
+    return;
+  }
+  if (pathname.startsWith('/api/custom-apis/') && method === 'PUT') {
+    const id = decodeURIComponent(pathname.slice('/api/custom-apis/'.length));
+    try {
+      const buf = await util.readBody(req);
+      const body = buf.length ? JSON.parse(buf.toString('utf8')) : {};
+      const r = store.updateCustomApi(id, body);
+      if (r.error) { util.sendJson(res, 400, { error: { message: r.error } }); return; }
+      logger.log('info', 'config', `更新自定义 API: ${id}`);
+      util.sendJson(res, 200, { api: r.api });
+    } catch (e) {
+      util.sendJson(res, 400, { error: { message: `更新自定义 API 失败: ${e.message}` } });
+    }
+    return;
+  }
+  if (pathname.startsWith('/api/custom-apis/') && method === 'DELETE') {
+    const id = decodeURIComponent(pathname.slice('/api/custom-apis/'.length));
+    const r = store.removeCustomApi(id);
+    if (!r.deleted) { util.sendJson(res, 404, { error: { message: '未找到该自定义 API' } }); return; }
+    logger.log('info', 'config', `删除自定义 API: ${id}`);
+    util.sendJson(res, 200, { ok: true, id });
+    return;
+  }
+  if (pathname.startsWith('/api/custom-apis/') && pathname.endsWith('/test') && method === 'POST') {
+    const id = decodeURIComponent(pathname.slice('/api/custom-apis/'.length, -'/test'.length));
+    const ep = store.customApiById(id);
+    if (!ep) { util.sendJson(res, 404, { error: { message: '未找到该自定义 API' } }); return; }
+    try {
+      const r = await util.requestJson(ep.baseUrl + '/models', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer ' + ep.apiKey, Accept: 'application/json' },
+        timeoutMs: 15000,
+      });
+      const ok = r.status >= 200 && r.status < 300;
+      const arr = r.json && r.json.data;
+      util.sendJson(res, ok ? 200 : 502, {
+        ok,
+        status: r.status,
+        modelCount: Array.isArray(arr) ? arr.length : 0,
+        error: ok ? undefined : (r.json && (r.json.error && r.json.error.message) || String(r.body || '').slice(0, 200)),
+      });
+    } catch (e) {
+      util.sendJson(res, 502, { ok: false, error: e.message });
     }
     return;
   }

@@ -14,32 +14,60 @@ const models = computed(() => modelData.value?.models || status.value?.models ||
 // 可用渠道（来自 /api/status，用于新增自定义模型时选择归属）
 const providers = computed(() => status.value?.providers || [{ kind: 'codebuddy', label: 'CodeBuddy' }]);
 
-// 按渠道分组展示：两家都有 glm-5.2 这类同名模型，必须分组才不混淆
+// 按渠道分组展示：两家都有 glm-5.2 这类同名模型，必须分组才不混淆。
+// 自定义 OpenAI 兼容 API（openai-custom）一个代理可配多个 endpoint，模型可能重名，
+// 故按 endpoint 维度二次拆组（组标题带 endpoint 名称与模型前缀）。
 const grouped = computed(() => {
   const map = new Map();
   for (const m of models.value) {
     const p = m.provider || 'codebuddy';
-    if (!map.has(p)) map.set(p, []);
-    map.get(p).push(m);
+    // openai-custom 按 endpoint 拆分（单 endpoint 时空 sub 仍独立成组）
+    const sub = p === 'openai-custom' ? (m.endpointId || m.prefix || '') : '';
+    const key = p + '\u0000' + sub;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(m);
   }
   // 保持 providers 声明顺序，未声明的渠道追加在后
   const order = providers.value.map((p) => p.kind);
   return [...map.entries()]
     .sort((a, b) => {
-      const ia = order.indexOf(a[0]); const ib = order.indexOf(b[0]);
+      const ia = order.indexOf(a[0].split('\u0000')[0]); const ib = order.indexOf(b[0].split('\u0000')[0]);
       return (ia < 0 ? 999 : ia) - (ib < 0 ? 999 : ib);
     })
-    .map(([kind, list]) => ({
-      kind,
-      label: providers.value.find((p) => p.kind === kind)?.label || kind,
-      models: list,
-    }));
+    .map(([key, list]) => {
+      const [kind, sub] = key.split('\u0000');
+      const first = list[0] || {};
+      const label = providers.value.find((p) => p.kind === kind)?.label || kind;
+      // openai-custom 的组标题 = endpoint 名称 + 前缀（如 "OpenRouter · oc/"）
+      const subtitle = kind === 'openai-custom' && first.endpointName
+        ? `${first.endpointName} · ${first.prefix || 'oc'}/`
+        : '';
+      return { kind, sub, label, subtitle, models: list };
+    });
 });
 
 /** 模型对外 id（后端返回 key；兜底同样按「渠道/模型」拼接，与后端规则保持一致） */
 function modelId(m) {
   if (m.key) return m.key;
   return (m.provider || 'codebuddy') + '/' + m.id;
+}
+
+/**
+ * 自定义 OpenAI 兼容 endpoint 的模型来自「自定义 API」页管理（增删/启停在那一页），
+ * 故在「模型」菜单里只读展示，禁用隐藏/编辑/删除（避免与 endpoint 管理脱节）。
+ */
+function canManage(m) {
+  return m.source !== 'custom-api' && m.builtin === false;
+}
+
+function sourceLabel(m) {
+  if (m.source === 'custom-api') return t('models.customApi');
+  return m.builtin === false ? t('models.custom') : t('models.builtin');
+}
+
+function sourceClass(m) {
+  if (m.source === 'custom-api') return 'badge-custom-api';
+  return m.builtin === false ? 'badge-custom' : 'badge-neutral';
 }
 
 /* ---- 新增 / 编辑模型弹窗 ---- */
@@ -147,11 +175,13 @@ async function toggleHidden(m) {
       <div v-if="loading" class="muted">{{ t('common.loading') }}</div>
       <div v-else-if="!models.length" class="empty"><span class="icon">◈</span>{{ t('common.empty') }}</div>
 
-      <!-- 按渠道分组：同渠道内是同一上游的模型，跨渠道可能重名（如 glm-5.2） -->
+      <!-- 按渠道分组：同渠道内是同一上游的模型，跨渠道可能重名（如 glm-5.2）；
+           自定义 OpenAI 兼容 endpoint 再按 endpoint 维度拆组 -->
       <div v-else class="groups">
-        <section v-for="g in grouped" :key="g.kind" class="group">
+        <section v-for="g in grouped" :key="g.kind + (g.sub || '')" class="group">
           <h3 class="group-title">
             <span class="channel-chip">{{ g.label }}</span>
+            <span v-if="g.subtitle" class="channel-sub">{{ g.subtitle }}</span>
             <span class="group-sub">{{ t('overview.modelCount', { count: g.models.length }) }}</span>
           </h3>
           <div class="table-wrap">
@@ -187,16 +217,14 @@ async function toggleHidden(m) {
                     <span v-if="!m.tools && !m.vision && !m.reasoning" class="muted">—</span>
                   </td>
                   <td>
-                    <span class="badge" :class="m.builtin === false ? 'badge-custom' : 'badge-neutral'">
-                      {{ m.builtin === false ? t('models.custom') : t('models.builtin') }}
-                    </span>
+                    <span class="badge" :class="sourceClass(m)">{{ sourceLabel(m) }}</span>
                   </td>
                   <td class="actions">
-                    <button class="btn btn-ghost btn-sm" :disabled="togglingHidden.has(modelId(m))" @click="toggleHidden(m)">
+                    <button class="btn btn-ghost btn-sm" :disabled="!canManage(m) || togglingHidden.has(modelId(m))" @click="toggleHidden(m)">
                       {{ m.hidden ? t('models.show') : t('models.hide') }}
                     </button>
-                    <button class="btn btn-ghost btn-sm" :disabled="m.builtin !== false" @click="openEdit(m)">{{ t('common.edit') }}</button>
-                    <button class="btn btn-danger btn-sm" :disabled="m.builtin !== false" @click="remove(m)">{{ t('common.delete') }}</button>
+                    <button class="btn btn-ghost btn-sm" :disabled="!canManage(m)" @click="openEdit(m)">{{ t('common.edit') }}</button>
+                    <button class="btn btn-danger btn-sm" :disabled="!canManage(m)" @click="remove(m)">{{ t('common.delete') }}</button>
                   </td>
                 </tr>
               </tbody>
@@ -271,6 +299,8 @@ async function toggleHidden(m) {
 .group-title { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 14px; }
 .channel-chip { padding: 2px 10px; border-radius: 999px; background: var(--accent-soft, rgba(127,127,127,.15)); color: var(--accent); font-weight: 700; font-size: 12px; }
 .group-sub { font-size: 12px; color: var(--text-2); font-weight: 400; }
+.channel-sub { font-size: 12px; color: var(--text-2); font-weight: 500; }
+.badge-custom-api { background: rgba(34,197,94,.14); color: #22c55e; border: 1px solid rgba(34,197,94,.3); }
 .tag { font-size: 11px; color: var(--text-2); border: 1px solid var(--border-strong); padding: 1px 7px; border-radius: 6px; margin-right: 4px; background: var(--surface-2); }
 .tag-reason { color: var(--accent); border-color: var(--accent-soft); }
 .badge { margin-left: 4px; }

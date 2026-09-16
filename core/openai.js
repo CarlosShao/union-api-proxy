@@ -110,9 +110,41 @@ async function handleProxy(req, res, pathname) {
     util.sendJson(res, 400, { error: { message: `未知渠道: ${resolved.kind}`, type: 'invalid_request_error' } });
     return true;
   }
+
+  /**
+   * 自带凭证的渠道（自定义 OpenAI 兼容 endpoint）：不需要账号池、不需要登录。
+   * 这里直接用模型前缀定位 endpoint 配置（baseUrl + apiKey），跳过 auth.pickAccountForRequest。
+   * 约定：模型前缀即 endpoint 的 model_prefix（或 id）。`oc/gpt-4o` 中 `oc` 命中某 endpoint。
+   */
+  const selfCredential = typeof provider.isSelfCredential === 'function'
+    ? provider.isSelfCredential()
+    : (resolved.kind === 'openai-custom');
+  let endpoint = null;
+  if (selfCredential) {
+    if (typeof provider.endpointFor === 'function') {
+      // 传入的是「前缀 / endpoint id」（resolved.kind 已为 openai-custom，前缀=裸 model 前的那段）
+      // resolved.model 是去掉前缀后的裸模型；前缀需从原始 model 反推：
+      const rawPrefix = String(payload.model || '').includes('/')
+        ? String(payload.model).slice(0, String(payload.model).indexOf('/'))
+        : '';
+      endpoint = provider.endpointFor(rawPrefix.toLowerCase()) || provider.lookupByModelPrefix(resolved.model);
+    }
+    if (!endpoint) {
+      // 回退：任意启用的自定义 endpoint（未配多 endpoint 时的默认行为）
+      const s = store.listCustomApis ? store : require('./store');
+      endpoint = (s.listCustomApis && s.listCustomApis().find((e) => e.enabled)) || null;
+    }
+    if (!endpoint) {
+      util.sendJson(res, 400, {
+        error: { message: '未配置可用的自定义 OpenAI 兼容 API，请先在管理页添加', type: 'invalid_request_error' },
+      });
+      return true;
+    }
+  }
+
   const isChat = CHAT_PATHS.has(pathname);
   // Trae SOLO 通道只有 chat 能力；completions/embeddings 仅 CodeBuddy 支持
-  if (!isChat && resolved.kind !== 'codebuddy') {
+  if (!isChat && resolved.kind !== 'codebuddy' && resolved.kind !== 'openai-custom') {
     util.sendJson(res, 400, {
       error: { message: `渠道 ${resolved.kind} 仅支持 /v1/chat/completions`, type: 'invalid_request_error' },
     });
@@ -125,21 +157,23 @@ async function handleProxy(req, res, pathname) {
   const needAggregate = isChat && !isStream;
 
   if (isChat) {
-    // DEBUG dump 记录「净化前」的载荷，便于定位 11128 触发词
+    // DEBUG dump 记录「净化前」的载荷，便于定位 11128 触发词（仅 CODEBUDDY_DEBUG=1 时启用）
     if (process.env.CODEBUDDY_DEBUG) {
       try {
         let raw = null;
         try { raw = JSON.parse(body.toString('utf8')); } catch { /* ignore */ }
-        fs.writeFileSync(require('path').join(require('os').tmpdir(), 'codebuddy-debug-last-chat.json'), JSON.stringify({ raw, chat: payload }, null, 2));
+        const dumpPath = require('path').join(require('os').tmpdir(), 'codebuddy-debug-last-chat.json');
+        fs.writeFileSync(dumpPath, JSON.stringify({ raw, chat: payload, ts: new Date().toISOString() }, null, 2));
         const rk = Object.keys(payload).filter((k) => /reason|think|effort/i.test(k));
         const rkv = rk.map((k) => `${k}=${JSON.stringify(payload[k])}`).join(' ');
-        logger.log('info', 'proxy', `debug dump -> ${require('os').tmpdir()}/codebuddy-debug-last-chat.json | msgs=[${(payload.messages || []).map((m) => `${m.role}:${JSON.stringify(m.content).length}${m.tool_calls ? `(tc:${m.tool_calls.length})` : ''}`).join(',')}] tools=${(payload.tools || []).length} | ${rkv}`);
+        logger.log('info', 'proxy', `debug dump -> ${dumpPath} | msgs=[${(payload.messages || []).map((m) => `${m.role}:${JSON.stringify(m.content).length}${m.tool_calls ? `(tc:${m.tool_calls.length})` : ''}`).join(',')}] tools=${(payload.tools || []).length} | ${rkv}`);
       } catch { /* ignore */ }
     }
     // 渠道专属请求体改写，只调用一次：
     //   codebuddy -> 竞品词/指纹句净化（绕 11128）
     //   traework  -> 转成 SOLO 格式（developer→system、function_call、stream 强制 true 等）
-    if (typeof provider.preparePayload === 'function') provider.preparePayload(payload);
+    //   openai-custom -> 原样透传（OpenAI 格式即上游格式）
+    if (typeof provider.preparePayload === 'function') provider.preparePayload(payload, endpoint);
   }
 
   if (needAggregate) payload.stream = true;
@@ -148,17 +182,22 @@ async function handleProxy(req, res, pathname) {
   // 若用改写后的 payload.stream 会把非流式请求误记为流式。
   const recordStream = isStream;
 
+  // 自带凭证渠道：跳过账号池，直接以 endpoint 作为「账号视图」
   const accountKey = auth.extractAccountKey(req, payload);
   let acct;
-  try { acct = await auth.pickAccountForRequest(accountKey, keyCheck.accountId || '', resolved.kind); }
-  catch (e) {
-    logger.log('warn', 'proxy', `${pathname} 拒绝: ${e.message}`, { pathname, model: payload.model, provider: resolved.kind });
-    util.sendJson(res, 401, { error: { message: e.message, type: 'authentication_error' } });
-    return true;
+  if (selfCredential) {
+    acct = endpoint; // 透传给 buildChatHeaders（openai-custom.buildChatHeaders 只吃 ep）
+  } else {
+    try { acct = await auth.pickAccountForRequest(accountKey, keyCheck.accountId || '', resolved.kind); }
+    catch (e) {
+      logger.log('warn', 'proxy', `${pathname} 拒绝: ${e.message}`, { pathname, model: payload.model, provider: resolved.kind });
+      util.sendJson(res, 401, { error: { message: e.message, type: 'authentication_error' } });
+      return true;
+    }
   }
 
-  const accountId = acct ? acct.id : '';
-  const accountName = acct ? (acct.name || (acct.account && (acct.account.nickname || acct.account.uid)) || '') : '';
+  const accountId = acct ? (acct.id || acct.baseUrl || '') : '';
+  const accountName = acct ? (acct.name || (acct.account && (acct.account.nickname || acct.account.uid)) || acct.baseUrl || '') : '';
 
   // 记录一次用量
   const record = (usage, status) => {
@@ -181,12 +220,18 @@ async function handleProxy(req, res, pathname) {
     ...provider.buildChatHeaders(acct),
     'Content-Type': 'application/json',
     // 官方 CLI 即使流式也发 Accept: application/json（服务端按 body.stream 返回 SSE）；
-    // Trae 侧由 provider 自己的头决定 Accept，故仅在缺省时补
+    // Trae / 自定义兼容 endpoint 侧由 provider 自己的头决定 Accept，故仅在缺省时补
     'Accept': headersAcceptFor(resolved.kind),
   };
-  const targetUrl = isChat ? provider.chatUrl(acct) : `${config.ENDPOINT}${upstreamPath}`;
+  // 目标地址：自带凭证渠道直接用 endpoint 的 baseUrl 拼路径；其它渠道沿用旧逻辑
+  let targetUrl;
+  if (selfCredential && endpoint) {
+    targetUrl = isChat ? provider.chatUrl(endpoint) : (upstreamPath === '/v1/embeddings' || upstreamPath === '/v2/embeddings' ? provider.embeddingsUrl(endpoint) : provider.completionsUrl(endpoint));
+  } else {
+    targetUrl = isChat ? provider.chatUrl(acct) : `${config.ENDPOINT}${upstreamPath}`;
+  }
   const startedAt = Date.now();
-  // 渠道专属流转换器（Trae 的 SOLO 事件流需要转换；CodeBuddy 返回 null 走默认路径）
+  // 渠道专属流转换器（Trae 的 SOLO 事件流需要转换；CodeBuddy / 自定义兼容 endpoint 返回 null 走默认路径）
   const converter = isChat && isStream && typeof provider.createSseConverter === 'function'
     ? provider.createSseConverter() : null;
   const aggregateFn = isChat && typeof provider.aggregate === 'function'

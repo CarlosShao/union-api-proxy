@@ -116,4 +116,91 @@ function modelsResponse(customModels, hiddenIds, extra) {
   return { object: 'list', data };
 }
 
-module.exports = { MODEL_CATALOG, allModels, modelsResponse, modelKey };
+/**
+ * 解析某个 endpoint 当前可用的模型列表（同步，只读缓存）：
+ *  - 用户填了白名单 -> 白名单（只有 id，无元数据）
+ *  - 否则 -> 动态缓存（由 refreshCustomApiModels 预拉，含上下文长度等元数据）
+ * 返回统一形状：{ id, name, maxInputTokens, maxOutputTokens, tools, vision, reasoning }
+ */
+function modelsForEndpoint(provider, ep) {
+  if (ep.models && ep.models.length) {
+    return ep.models.map((id) => ({
+      id, name: id, maxInputTokens: 0, maxOutputTokens: 0,
+      tools: true, vision: false, reasoning: false,
+    }));
+  }
+  if (provider && typeof provider.getCachedModelsForEndpoint === 'function') {
+    return provider.getCachedModelsForEndpoint(ep.id);
+  }
+  return [];
+}
+
+/**
+ * 自定义 OpenAI 兼容 API 的模型列表（/v1/models 的 data 条目）。
+ * 每个启用的 endpoint 贡献一组模型，外部 id = `${model_prefix}/${model}`（如 cmdc/gpt-5.5）。
+ * 需调用方先触发 refreshCustomApiModels（异步），本函数只同步读缓存。
+ * 上游给了 context_length 就一并输出（与 OpenAI 规范一致）。
+ */
+function customApiModelEntries(store, provider) {
+  const out = [];
+  for (const ep of store.listCustomApis().filter((e) => e.enabled)) {
+    const prefix = ep.modelPrefix || 'oc';
+    for (const m of modelsForEndpoint(provider, ep)) {
+      const entry = { id: `${prefix}/${m.id}`, object: 'model', created: Math.floor(Date.now() / 1000), owned_by: prefix, name: m.name || m.id };
+      // 无数据则不输出该字段，避免客户端误判为 0
+      if (m.maxInputTokens > 0) entry.context_length = m.maxInputTokens;
+      if (m.maxOutputTokens > 0) entry.max_output_tokens = m.maxOutputTokens;
+      out.push(entry);
+    }
+  }
+  return out;
+}
+
+/**
+ * 自定义 OpenAI 兼容 API 的模型（管理页「模型」菜单用，与 allModels 条目同构）。
+ * 每个启用的 endpoint 贡献一组模型，按 endpoint 维度归类（一个代理可配多个 endpoint）。
+ * 字段与 allModels 输出保持一致，便于前端统一分组渲染：
+ *  - provider: 'openai-custom'（前端据此归属「OpenAI Compatible」渠道）
+ *  - key: 对外 id `${prefix}/${model}`（与 /v1/models 一致）
+ *  - endpointId / endpointName：二级分组（同一渠道内多个 endpoint 不混淆）
+ *  - builtin: false 且 source='custom-api'，前端禁用 hide/edit/delete
+ */
+function customApiModelsForManage(store, provider) {
+  const out = [];
+  for (const ep of store.listCustomApis().filter((e) => e.enabled)) {
+    const prefix = ep.modelPrefix || 'oc';
+    for (const m of modelsForEndpoint(provider, ep)) {
+      out.push({
+        id: m.id,
+        name: m.name || m.id,
+        provider: 'openai-custom',
+        key: `${prefix}/${m.id}`,
+        endpointId: ep.id,
+        endpointName: ep.name || prefix,
+        prefix,
+        builtin: false,
+        source: 'custom-api',
+        maxInputTokens: m.maxInputTokens || 0,
+        maxOutputTokens: m.maxOutputTokens || 0,
+        tools: m.tools !== false,
+        vision: !!m.vision,
+        reasoning: !!m.reasoning,
+        region: 'intl',
+        hidden: false,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * 触发所有启用 endpoint 的上游 /models 刷新（异步，带缓存与失败冷却）。
+ * 路由在返回 /v1/models 与 /api/models 前调用，保证展示真实模型列表。
+ */
+async function refreshCustomApiModels() {
+  const provider = providers.getProvider('openai-custom');
+  if (!provider || typeof provider.refreshAllModels !== 'function') return;
+  try { await provider.refreshAllModels(); } catch { /* 单个 endpoint 失败不影响整体 */ }
+}
+
+module.exports = { MODEL_CATALOG, allModels, modelsResponse, modelKey, customApiModelEntries, customApiModelsForManage, refreshCustomApiModels };
