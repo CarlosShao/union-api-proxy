@@ -74,6 +74,28 @@ async function listModels(acct) {
  * 这是 CodeBuddy 独有的适配，**不要**套用到其它渠道。
  */
 function preparePayload(payload) {
+  // CodeBuddy 上游 `/v2/chat/completions` 不识别 OpenAI 的 `developer` 角色：
+  // 请求里一旦出现该角色，整包会被安全策略判为「Illegal API invocation from an unapproved
+  // channel」(11128) 直接拒绝——与消息内容无关，纯粹由角色名触发渠道校验。
+  // Codex / dsh 等 OpenAI 兼容客户端用 `developer` 承载系统提示词，须降级为语义等价的 `system`。
+  if (payload && Array.isArray(payload.messages)) {
+    const msgs = payload.messages;
+    for (const m of msgs) {
+      if (m && m.role === 'developer') m.role = 'system';
+    }
+    // 降级后若出现多条 system 消息，合并进第一条，避免部分上游拒绝多 system。
+    const systems = msgs.filter((m) => m && m.role === 'system');
+    if (systems.length > 1) {
+      const first = systems[0];
+      for (const m of systems.slice(1)) {
+        const a = first.content, b = m.content;
+        if (typeof a === 'string' && typeof b === 'string') first.content = a + '\n\n' + b;
+        else if (Array.isArray(a) && Array.isArray(b)) first.content = a.concat(b);
+        else first.content = String(a) + '\n\n' + String(b);
+      }
+      payload.messages = msgs.filter((m) => !(m && m.role === 'system' && m !== first));
+    }
+  }
   sanitize.sanitizeChatPayload(payload);
   return payload;
 }
