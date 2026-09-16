@@ -203,4 +203,39 @@ async function refreshCustomApiModels() {
   try { await provider.refreshAllModels(); } catch { /* 单个 endpoint 失败不影响整体 */ }
 }
 
-module.exports = { MODEL_CATALOG, allModels, modelsResponse, modelKey, customApiModelEntries, customApiModelsForManage, refreshCustomApiModels };
+/**
+ * 查某渠道某模型的上下文窗口（token）。返回 0 表示未知。
+ *
+ * 用途：上游返回**空错误体**时，判断"是否可能因请求超出上下文而被拒"——
+ * 只有估算确实逼近/超过窗口时才把错误标成上下文溢出，避免误触发
+ * 客户端的压缩重试（那会白白压缩一次、丢掉上下文细节）。
+ */
+function contextWindowOf(kind, modelId) {
+  const id = String(modelId || '').trim();
+  if (!id) return 0;
+  // 1) 内置目录（codebuddy 的模型表）
+  const builtin = MODEL_CATALOG.find((m) => m.id === id);
+  if (builtin && builtin.maxInputTokens > 0) return builtin.maxInputTokens;
+  const provider = providers.getProvider(kind);
+  if (!provider) return 0;
+  // 2) 渠道自带静态表（如 traework）
+  if (typeof provider.staticModels === 'function') {
+    try {
+      const s = (provider.staticModels() || []).find((m) => m.id === id);
+      if (s && s.maxInputTokens > 0) return s.maxInputTokens;
+    } catch { /* 单个渠道异常不影响判断 */ }
+  }
+  // 3) 自定义 endpoint 的上游动态缓存
+  if (typeof provider.getCachedModelsForEndpoint === 'function') {
+    try {
+      const store = require('./store');
+      for (const ep of store.listCustomApis()) {
+        const hit = (provider.getCachedModelsForEndpoint(ep.id) || []).find((m) => m.id === id);
+        if (hit && hit.maxInputTokens > 0) return hit.maxInputTokens;
+      }
+    } catch { /* ignore */ }
+  }
+  return 0;
+}
+
+module.exports = { MODEL_CATALOG, allModels, modelsResponse, modelKey, customApiModelEntries, customApiModelsForManage, refreshCustomApiModels, contextWindowOf };

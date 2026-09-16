@@ -10,6 +10,7 @@ const logger = require('./logger');
 const util = require('./util');
 const auth = require('./auth');
 const providers = require('./providers/all');
+const models = require('./models');
 
 const UPSTREAM_MAP = {
   '/v1/chat/completions': '/v2/chat/completions',
@@ -237,6 +238,28 @@ async function handleProxy(req, res, pathname) {
   const aggregateFn = isChat && typeof provider.aggregate === 'function'
     ? provider.aggregate : aggregateSseToCompletion;
 
+  /**
+   * 上游「空错误体」的兜底判断。
+   *
+   * 某些上游报错时只给状态码、不给 body（实测腾讯 CodeBuddy）。客户端拿到
+   * `400 (no body)` 后无法把错误归类为上下文溢出，也就不会触发「压缩后重试」，
+   * 只能把原始错误抛给用户。
+   *
+   * 这里用请求体字节数粗估 prompt token（中英混排约 3 字节/token），与该模型
+   * 已知的上下文窗口比较：只有确实逼近/超过窗口时才标记为溢出，避免误触发
+   * 客户端的压缩（那会白白压掉一次上下文细节）。
+   */
+  const errFallback = (() => {
+    const win = isChat ? models.contextWindowOf(resolved.kind, resolved.model) : 0;
+    const approxPromptTokens = Math.ceil(Buffer.byteLength(jsonBody, 'utf8') / 3);
+    const overflow = win > 0 && approxPromptTokens > win * 0.9;
+    return {
+      overflow,
+      detail: `model=${resolved.model}, approxPromptTokens≈${approxPromptTokens}`
+        + (win > 0 ? `, contextWindow=${win}` : ', contextWindow=unknown'),
+    };
+  })();
+
   try {
     if (needAggregate) {
       const r = await util.requestRaw(targetUrl, { method: 'POST', headers, body: jsonBody, timeoutMs });
@@ -252,12 +275,18 @@ async function handleProxy(req, res, pathname) {
       } else {
         logger.log('warn', 'proxy', `${pathname} 上游非流式响应 ${r.status}`, logger.requestSummary(payload, { status: r.status, durationMs: Date.now() - startedAt }));
         record(null, upstreamOk ? 'ok' : 'error');
-        res.writeHead(r.status, { 'Content-Type': ct || 'application/json', 'Access-Control-Allow-Origin': '*' });
-        res.end(r.body);
+        // 上游错误体为空时合成一个：否则客户端只看到 "(no body)"，既无法诊断也识别不了溢出
+        const emptyErr = !upstreamOk && !String(r.body || '').trim();
+        const outBody = emptyErr ? util.synthesizeUpstreamError(r.status, errFallback) : r.body;
+        res.writeHead(r.status, {
+          'Content-Type': emptyErr ? 'application/json; charset=utf-8' : (ct || 'application/json'),
+          'Access-Control-Allow-Origin': '*',
+        });
+        res.end(outBody);
       }
     } else if (isStream) {
       await util.pipeSseToClient(res, targetUrl, {
-        method: 'POST', headers, body: jsonBody, converter,
+        method: 'POST', headers, body: jsonBody, converter, errorFallback: errFallback,
         extraHeaders: { 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' },
       }, ({ usage, status }) => record(usage, status));
       logger.log('info', 'proxy', `${pathname} 流式结束 (${Date.now() - startedAt}ms)`, logger.requestSummary(payload, { stream: true, durationMs: Date.now() - startedAt }));
@@ -265,11 +294,13 @@ async function handleProxy(req, res, pathname) {
       const r = await util.requestJson(targetUrl, { method: 'POST', headers, body: jsonBody, timeoutMs });
       logger.log('info', 'proxy', `${pathname} 完成 (${Date.now() - startedAt}ms)`, logger.requestSummary(payload, { stream: false, status: r.status, durationMs: Date.now() - startedAt }));
       record(r.json && r.json.usage, r.status === 200 ? 'ok' : 'error');
+      const emptyErr = r.status >= 300 && !String(r.body || '').trim();
+      const outBody = emptyErr ? util.synthesizeUpstreamError(r.status, errFallback) : r.body;
       res.writeHead(r.status, {
-        'Content-Type': (r.headers && r.headers['content-type']) || 'application/json',
+        'Content-Type': emptyErr ? 'application/json; charset=utf-8' : ((r.headers && r.headers['content-type']) || 'application/json'),
         'Access-Control-Allow-Origin': '*',
       });
-      res.end(r.body);
+      res.end(outBody);
     }
   } catch (e) {
     logger.log('error', 'proxy', `${pathname} 上游错误: ${e.message}`, logger.requestSummary(payload, { stream: isStream, durationMs: Date.now() - startedAt }));

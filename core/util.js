@@ -135,7 +135,7 @@ function normalizeSseBlock(block) {
  *   两种路径最终都经过 normalizeSseBlock —— 这是防止 AI SDK 把思考 delta
  *   切成大量碎片（UI 表现为反复「思考了几秒」）的关键，对所有渠道一视同仁。
  */
-function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, body = null, extraHeaders = {}, converter = null }, onDone) {
+function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, body = null, extraHeaders = {}, converter = null, errorFallback = null }, onDone) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlStr);
     const mod = u.protocol === 'https:' ? https : http;
@@ -169,18 +169,43 @@ function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, bod
     };
 
     const upstream = mod.request(u, { method, headers: finalHeaders, agent: agentFor(u.protocol) }, (upRes) => {
-      const respHeaders = { ...(upRes.headers || {}), ...extraHeaders };
-      clientRes.writeHead(upRes.statusCode || 502, respHeaders);
       const upstreamOk = upRes.statusCode >= 200 && upRes.statusCode < 300;
-      if (!upstreamOk) status = 'error';
 
-      // 上游报错：原始体直接透传，不能喂给转换器（会把错误文本转成空回复）
+      // 上游报错：原始体直接透传，不能喂给转换器（会把错误文本转成空回复）。
+      // 但若上游给的是**空错误体**，客户端（如 DSH）拿不到任何错误信息，
+      // 既无法诊断、也无法把它归类成「上下文溢出」去触发压缩重试——这时合成一个。
       if (!upstreamOk) {
-        upRes.pipe(clientRes);
-        upRes.on('end', () => { report(); resolve(); });
+        status = 'error';
+        const errChunks = [];
+        upRes.on('data', (c) => errChunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
         upRes.on('error', (e) => { report(); reject(e); });
+        upRes.on('end', () => {
+          const raw = Buffer.concat(errChunks);
+          const headers = { ...(upRes.headers || {}), ...extraHeaders };
+          if (raw.toString('utf8').trim()) {
+            clientRes.writeHead(upRes.statusCode || 502, headers);
+            clientRes.end(raw);
+          } else {
+            // 上游常带 Content-Length: 0 或 Transfer-Encoding: chunked，
+            // 两者都与"我自己给出完整长度的合成体"冲突，必须先删掉
+            delete headers['content-length'];
+            delete headers['Content-Length'];
+            delete headers['transfer-encoding'];
+            delete headers['Transfer-Encoding'];
+            const synthesized = synthesizeUpstreamError(upRes.statusCode, errorFallback);
+            headers['Content-Type'] = 'application/json; charset=utf-8';
+            headers['Content-Length'] = Buffer.byteLength(synthesized);
+            clientRes.writeHead(upRes.statusCode || 502, headers);
+            clientRes.end(synthesized);
+          }
+          report();
+          resolve();
+        });
         return;
       }
+
+      const respHeaders = { ...(upRes.headers || {}), ...extraHeaders };
+      clientRes.writeHead(upRes.statusCode || 502, respHeaders);
 
       // 转换器模式下上游是自定义事件流，按 \n\n 切块无意义，必须整段喂给 converter
       if (converter) {
@@ -352,8 +377,43 @@ function genId(prefix) {
   return `${prefix}_${crypto.randomBytes(12).toString('hex')}`;
 }
 
+/**
+ * 上游返回错误、但响应体为空时，合成一个 JSON 错误体。
+ *
+ * 为什么需要：某些上游（实测腾讯 CodeBuddy）报错时只给状态码、不给 body。
+ * 客户端拿到 `400 (no body)` 后既无法诊断，也无法把错误归类为「上下文溢出」，
+ * 于是不会触发它自己的「压缩后重试」恢复路径，只能把原始错误甩给用户。
+ *
+ * fallback.overflow 为真时，文案带上客户端能识别的溢出特征
+ * （DSH 的正则认得 `maximum context length` 这种写法）。
+ *
+ * @param {number} status 上游 HTTP 状态码
+ * @param {{ overflow?: boolean, detail?: string }} [fallback] 代理侧的判断与补充说明
+ * @returns {string} JSON 字符串
+ */
+function synthesizeUpstreamError(status, fallback) {
+  const f = fallback || {};
+  const suffix = f.detail ? ` (${f.detail})` : '';
+  if (f.overflow) {
+    return JSON.stringify({
+      error: {
+        message: `maximum context length exceeded: upstream rejected the request with HTTP ${status} and no body${suffix}`,
+        type: 'context_length_exceeded',
+        code: status,
+      },
+    });
+  }
+  return JSON.stringify({
+    error: {
+      message: `upstream rejected the request with HTTP ${status} and an empty body${suffix}`,
+      type: 'proxy_upstream_error',
+      code: status,
+    },
+  });
+}
+
 module.exports = {
   requestJson, requestRaw, pipeToClient, pipeSseToClient, readBody,
   sendJson, sendHtml, sendFile, MIME_TYPES, corsHeaders,
-  escapeHtml, maskedToken, genId, agentFor,
+  escapeHtml, maskedToken, genId, agentFor, synthesizeUpstreamError,
 };
