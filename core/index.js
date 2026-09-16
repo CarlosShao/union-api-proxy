@@ -117,12 +117,20 @@ function start() {
     }
   });
 
-  // 优雅关闭：刷新日志缓冲区和账号池变更
-  const shutdown = () => {
+  // 优雅关闭：刷新日志缓冲区和账号池变更，随后真正退出进程。
+  // 注意：注册 SIGINT 监听后 Node 不再执行 Ctrl+C 默认退出，必须手动 process.exit，
+  // 否则 server 的活跃 listen socket 会让事件循环常驻，进程无法退出（端口一直被占）。
+  let shuttingDown = false;
+  const shutdown = (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     try { sessionMod.flushPersist(); } catch { /* ignore */ }
+    try { server.close(() => process.exit(0)); } catch { process.exit(0); }
+    // 兜底：若还有长连接导致 server.close 回调不触发，强制退出
+    setTimeout(() => process.exit(0), 3000).unref();
   };
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 
   return server;
 }
