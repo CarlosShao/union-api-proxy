@@ -3,8 +3,11 @@
  * 验收演示：对比「移植前」与「移植后」在请求体上的差别。
  *
  * 全部离线运行（不连网络、不碰数据库、不需要登录态），直接对比
- *   before = git show main:core/...   （你现在的线上代码）
- *   after  = 当前工作区               （本次移植结果）
+ *   before = BASE_REF 指向的旧代码
+ *   after  = 当前工作区
+ *
+ * 基线刻意钉死在具体 sha 而不是用 main：改动一旦合并进 main，
+ * 「前后对比」的基线必须保持不变，否则脚本会拿新代码跟自己比而失去意义。
  *
  * 运行：node test/acceptance-demo.js
  */
@@ -15,13 +18,16 @@ const { execFileSync } = require('child_process');
 
 const ROOT = path.join(__dirname, '..');
 
-/** 取 main 分支上的旧模块（临时落到临时目录，避免污染工作区） */
+/** 移植前 main 的 HEAD（本次上游移植工作的起点） */
+const BASE_REF = 'a4573d3';
+
+/** 取基线 ref 上的旧模块（临时落到临时目录，避免污染工作区） */
 function loadFromMain(relPath) {
   const os = require('os');
   const fs = require('fs');
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'uap-before-'));
   const abs = relPath.replace(/\\/g, '/');
-  const src = execFileSync('git', ['show', `main:${abs}`], { cwd: ROOT, encoding: 'utf8' });
+  const src = execFileSync('git', ['show', `${BASE_REF}:${abs}`], { cwd: ROOT, encoding: 'utf8' });
   const file = path.join(tmp, path.basename(relPath));
   fs.writeFileSync(file, src, 'utf8');
   return file;
@@ -211,7 +217,7 @@ demo(
 /* ---------- 3. 版本徽标 ---------- */
 const readTopBar = (ref) => {
   const fs = require('node:fs');
-  if (ref === 'main') return execFileSync('git', ['show', 'main:web/src/components/TopBar.vue'], { cwd: ROOT, encoding: 'utf8' });
+  if (ref === 'main') return execFileSync('git', ['show', `${BASE_REF}:web/src/components/TopBar.vue`], { cwd: ROOT, encoding: 'utf8' });
   return fs.readFileSync(path.join(ROOT, 'web/src/components/TopBar.vue'), 'utf8');
 };
 

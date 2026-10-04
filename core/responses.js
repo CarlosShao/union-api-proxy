@@ -218,15 +218,36 @@ function convertUsage(u) {
   };
 }
 
-/** 构建一个 Responses API 响应对象 */
+/** 构建一个 Responses API 响应对象（output 按固化的 output_index 升序） */
 function buildResponseObject(state, status) {
-  const output = [];
+  const done = status === 'completed';
+  const items = [];
+  // 按 item 首次出现时固化的 oi 排序，保证 output 顺序与流式事件里发出的
+  // output_index 严格一致（「先正文、后又来工具」时 message 实际排在后出现的
+  // 工具之前；若按类型分组排列就会与事件序列对不上）。
+  if (state.reasoningStarted || state.reasoning) {
+    items.push({
+      oi: state.reasoningIndex == null ? 0 : state.reasoningIndex,
+      item: {
+        id: state.reasoningId, type: 'reasoning', status: done ? 'completed' : 'in_progress',
+        summary: state.reasoning ? [{ type: 'summary_text', text: state.reasoning }] : [],
+      },
+    });
+  }
   for (const t of state.toolCalls) {
-    output.push({ id: t.id, type: 'function_call', call_id: t.call_id, name: t.name, arguments: t.args, status: status === 'completed' ? 'completed' : 'in_progress' });
+    items.push({
+      oi: t.oi == null ? 0 : t.oi,
+      item: { id: t.id, type: 'function_call', call_id: t.call_id, name: t.name, arguments: t.args, status: done ? 'completed' : 'in_progress' },
+    });
   }
   if (state.msgStarted || state.content) {
-    output.push({ id: state.msgId, type: 'message', status: status === 'completed' ? 'completed' : 'in_progress', role: 'assistant', content: state.content ? [{ type: 'output_text', text: state.content, annotations: [] }] : [] });
+    items.push({
+      oi: state.msgIndex == null ? 0 : state.msgIndex,
+      item: { id: state.msgId, type: 'message', status: done ? 'completed' : 'in_progress', role: 'assistant', content: state.content ? [{ type: 'output_text', text: state.content, annotations: [] }] : [] },
+    });
   }
+  items.sort((a, b) => a.oi - b.oi);
+  const output = items.map((x) => x.item);
   return {
     id: state.responseId,
     object: 'response',
@@ -253,7 +274,13 @@ function chatCompletionToResponse(completion, req) {
   const msgId = util.genId('msg');
 
   if (message.reasoning_content) {
-    output.push({ id: util.genId('rs'), type: 'reasoning', summary: [], content: [{ type: 'summary_text', text: message.reasoning_content, annotations: [] }] });
+    // reasoning 项的正文放在 summary 里；summary_text 是一个分片对象，
+    // 不该再套 annotations，也不该用 content（Responses schema 里 reasoning 项
+    // 没有 content 字段，用了属于非规范输出）。
+    output.push({
+      id: util.genId('rs'), type: 'reasoning', status: 'completed',
+      summary: [{ type: 'summary_text', text: message.reasoning_content }],
+    });
   }
   if (Array.isArray(message.tool_calls) && message.tool_calls.length) {
     for (const tc of message.tool_calls) {
@@ -297,6 +324,7 @@ function streamChatToResponses(clientRes, urlStr, headers, body, originalReq, co
       seq: 0,
       responseId: util.genId('resp'),
       msgId: util.genId('msg'),
+      reasoningId: util.genId('rs'),
       model: originalReq.model || store.getConfig().defaultModel || 'default',
       created: Math.floor(Date.now() / 1000),
       req: originalReq,
@@ -305,6 +333,10 @@ function streamChatToResponses(clientRes, urlStr, headers, body, originalReq, co
       toolCalls: [],
       toolIndex: {},
       started: false,
+      reasoningStarted: false,
+      nextOutputIndex: 0,
+      reasoningIndex: null,
+      msgIndex: null,
       msgStarted: false,
       finishReason: 'stop',
       usage: null,
@@ -323,10 +355,36 @@ function streamChatToResponses(clientRes, urlStr, headers, body, originalReq, co
       emit('response.in_progress', { response: buildResponseObject(state, 'in_progress') });
     };
 
+    // reasoning 输出项必须排在 message 之前，否则 Codex 的事件顺序校验会失败。
+    // 此前上游 delta.reasoning_content 一直被累计到 state 却从不转发，思维链在
+    // 流式下完全丢失（只有非流式路径有）。
+    const ensureReasoning = () => {
+      if (state.reasoningStarted) return;
+      state.reasoningStarted = true;
+      const oi = state.nextOutputIndex++;
+      state.reasoningIndex = oi;
+      emit('response.output_item.added', { output_index: oi, item: { id: state.reasoningId, type: 'reasoning', status: 'in_progress', summary: [] } });
+      emit('response.reasoning_summary_part.added', { item_id: state.reasoningId, output_index: oi, summary_index: 0, part: { type: 'summary_text', text: '' } });
+    };
+
+    // output_index 分配：reasoning（若有）占 0，其后每个 item 按**首次出现顺序**
+    // 依次领取并固化一个下标，存在 item 自己的 oi 上。
+    //
+    // 不能用「基址 + 当前位置」现算（如 outputBase() + toolCalls.length）：
+    // 那要求 item 永远连续到达，而「先出正文、之后又来工具调用」时
+    // toolCalls.length 会继续增长，同一个 message 的 added 与 done 会算出不同的
+    // index（1 vs 2），还会和后来的工具撞号 —— SSE 序列非法。
+    const allocOutputIndex = () => state.nextOutputIndex++;
+    /** 第 pos 个 function_call 的 output_index（创建时已固化） */
+    const toolOutputIndex = (pos) => state.toolCalls[pos].oi;
+    /** message 的 output_index（创建时已固化；未开始则为 null） */
+    const msgOutputIndex = () => state.msgIndex;
+
     const ensureMessage = () => {
       if (state.msgStarted) return;
       state.msgStarted = true;
-      const oi = state.toolCalls.length;
+      const oi = allocOutputIndex();
+      state.msgIndex = oi;
       emit('response.output_item.added', { output_index: oi, item: { id: state.msgId, type: 'message', status: 'in_progress', role: 'assistant', content: [] } });
       emit('response.content_part.added', { item_id: state.msgId, output_index: oi, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } });
     };
@@ -341,12 +399,30 @@ function streamChatToResponses(clientRes, urlStr, headers, body, originalReq, co
       if (chunk.usage) state.usage = chunk.usage;
       if (choice.finish_reason) state.finishReason = choice.finish_reason;
 
+      // 先处理 reasoning：它必须整段排在正文/工具调用之前。
+      // 注意不能写成 a ?? b ?? c 的级联：当 delta.reasoning 是对象时，
+      // 中间分支会求值成 ''（非 nullish），导致读 .content 的第三分支永远不可达。
+      const r = delta.reasoning;
+      const rc = delta.reasoning_content
+        ?? (typeof r === 'string' ? r : (r && typeof r.content === 'string' ? r.content : ''));
+      if (typeof rc === 'string' && rc) {
+        if (!state.msgStarted && !state.toolCalls.length) {
+          ensureReasoning();
+          state.reasoning += rc;
+          emit('response.reasoning_summary_text.delta', { item_id: state.reasoningId, output_index: state.reasoningIndex, summary_index: 0, delta: rc });
+        } else {
+          // 正文/工具调用已开始后才吐 reasoning：此时再插 reasoning 会破坏已发出的
+          // output_index（reasoning 必须占 0），只能累加到 state 里，供最终
+          // response.completed 的 output 使用；流式事件不再补发，避免序列自相矛盾。
+          state.reasoning += rc;
+        }
+      }
+
       if (typeof delta.content === 'string' && delta.content) {
         ensureMessage();
         state.content += delta.content;
-        emit('response.output_text.delta', { item_id: state.msgId, output_index: state.toolCalls.length, content_index: 0, delta: delta.content });
+        emit('response.output_text.delta', { item_id: state.msgId, output_index: msgOutputIndex(), content_index: 0, delta: delta.content });
       }
-      if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) state.reasoning += delta.reasoning_content;
 
       if (Array.isArray(delta.tool_calls)) {
         for (const tc of delta.tool_calls) {
@@ -355,8 +431,11 @@ function streamChatToResponses(clientRes, urlStr, headers, body, originalReq, co
             const pos = state.toolCalls.length;
             state.toolIndex[idx] = pos;
             const id = tc.id || util.genId('fc');
-            state.toolCalls.push({ id, call_id: id, name: '', args: '' });
-            emit('response.output_item.added', { output_index: pos, item: { id, type: 'function_call', call_id: id, name: '', arguments: '', status: 'in_progress' } });
+            // oi 在创建时分配并固化，done 阶段直接复用，保证同一 item 的
+            // added/done 拿到相同 output_index。
+            const oi = allocOutputIndex();
+            state.toolCalls.push({ id, call_id: id, name: '', args: '', oi });
+            emit('response.output_item.added', { output_index: oi, item: { id, type: 'function_call', call_id: id, name: '', arguments: '', status: 'in_progress' } });
           }
           const pos = state.toolIndex[idx];
           const t = state.toolCalls[pos];
@@ -371,15 +450,40 @@ function streamChatToResponses(clientRes, urlStr, headers, body, originalReq, co
 
     const finish = () => {
       ensureStarted();
-      if (state.msgStarted) {
-        const oi = state.toolCalls.length;
-        emit('response.output_text.done', { item_id: state.msgId, output_index: oi, content_index: 0, text: state.content });
-        emit('response.content_part.done', { item_id: state.msgId, output_index: oi, content_index: 0, part: { type: 'output_text', text: state.content, annotations: [] } });
-        emit('response.output_item.done', { output_index: oi, item: { id: state.msgId, type: 'message', status: 'completed', role: 'assistant', content: state.content ? [{ type: 'output_text', text: state.content, annotations: [] }] : [] } });
+      // item 的完结顺序必须按固化的 output_index 升序，且与 buildResponseObject
+      // 里 output 数组的顺序完全一致，否则严格校验的客户端（Codex）会认为
+      // 事件序列非法。注意不能按类型分组发：「先正文、后又来工具」时 message
+      // 的 oi 夹在两个 function_call 之间。
+      const done = [];
+      if (state.reasoningStarted) {
+        done.push({
+          oi: state.reasoningIndex,
+          run: () => {
+            emit('response.reasoning_summary_text.done', { item_id: state.reasoningId, output_index: state.reasoningIndex, summary_index: 0, text: state.reasoning });
+            emit('response.reasoning_summary_part.done', { item_id: state.reasoningId, output_index: state.reasoningIndex, summary_index: 0, part: { type: 'summary_text', text: state.reasoning } });
+            emit('response.output_item.done', { output_index: state.reasoningIndex, item: { id: state.reasoningId, type: 'reasoning', status: 'completed', summary: [{ type: 'summary_text', text: state.reasoning }] } });
+          },
+        });
       }
-      state.toolCalls.forEach((t, pos) => {
-        emit('response.output_item.done', { output_index: pos, item: { id: t.id, type: 'function_call', call_id: t.call_id, name: t.name, arguments: t.args, status: 'completed' } });
-      });
+      for (const t of state.toolCalls) {
+        done.push({
+          oi: toolOutputIndex(state.toolCalls.indexOf(t)),
+          run: () => emit('response.output_item.done', { output_index: t.oi, item: { id: t.id, type: 'function_call', call_id: t.call_id, name: t.name, arguments: t.args, status: 'completed' } }),
+        });
+      }
+      if (state.msgStarted) {
+        done.push({
+          oi: msgOutputIndex(),
+          run: () => {
+            const oi = msgOutputIndex();
+            emit('response.output_text.done', { item_id: state.msgId, output_index: oi, content_index: 0, text: state.content });
+            emit('response.content_part.done', { item_id: state.msgId, output_index: oi, content_index: 0, part: { type: 'output_text', text: state.content, annotations: [] } });
+            emit('response.output_item.done', { output_index: oi, item: { id: state.msgId, type: 'message', status: 'completed', role: 'assistant', content: state.content ? [{ type: 'output_text', text: state.content, annotations: [] }] : [] } });
+          },
+        });
+      }
+      done.sort((a, b) => (a.oi || 0) - (b.oi || 0));
+      for (const d of done) d.run();
       emit('response.completed', { response: buildResponseObject(state, 'completed') });
       clientRes.end();
     };
@@ -595,5 +699,5 @@ async function handleResponses(req, res) {
   }
 }
 
-// responsesToChatInput 导出以便回归测试直接驱动（见 test/reasoning.js）
-module.exports = { handleResponses, responsesToChatInput };
+// responsesToChatInput / streamChatToResponses 导出以便回归测试直接驱动（见 test/responses-stream.js）
+module.exports = { handleResponses, responsesToChatInput, streamChatToResponses };
