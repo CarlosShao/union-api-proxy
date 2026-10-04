@@ -185,11 +185,14 @@ async function handleProxy(req, res, pathname) {
 
   // 自带凭证渠道：跳过账号池，直接以 endpoint 作为「账号视图」
   const accountKey = auth.extractAccountKey(req, payload);
+  // 会话粘性：同一段对话固定落在同一账号。没有它时每个请求都轮换账号，
+  // agent 跑十几步工具调用就换十几个账号，prompt cache 命中率几乎归零。
+  const sessionKey = auth.extractSessionKey(req, payload, resolved.kind, keyCheck.keyId || '');
   let acct;
   if (selfCredential) {
     acct = endpoint; // 透传给 buildChatHeaders（openai-custom.buildChatHeaders 只吃 ep）
   } else {
-    try { acct = await auth.pickAccountForRequest(accountKey, keyCheck.accountId || '', resolved.kind); }
+    try { acct = await auth.pickAccountForRequest(accountKey, keyCheck.accountId || '', resolved.kind, sessionKey); }
     catch (e) {
       logger.log('warn', 'proxy', `${pathname} 拒绝: ${e.message}`, { pathname, model: payload.model, provider: resolved.kind });
       util.sendJson(res, 401, { error: { message: e.message, type: 'authentication_error' } });

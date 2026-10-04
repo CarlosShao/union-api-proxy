@@ -80,7 +80,15 @@ function normalizePoolAccount(acct) {
 
 /** 单渠道的默认池配置 */
 function defaultPool(provider) {
-  return { provider, mode: 'pool', strategy: 'round-robin', pinnedId: null, cursor: 0 };
+  return {
+    provider,
+    mode: 'pool',
+    strategy: 'round-robin',
+    pinnedId: null,
+    cursor: 0,
+    stickyEnabled: true,   // 会话粘性：把一次对话固定到同一账号（保住 prompt cache）
+    stickyTtlMin: 30,      // 绑定存活分钟数
+  };
 }
 
 /** 从旧版池结构里提取逐渠道池配置（旧数据结构只有一个全局 pool） */
@@ -93,6 +101,8 @@ function normalizePoolsFromLegacy(raw, accounts) {
       strategy: raw.pool.strategy || 'round-robin',
       pinnedId: raw.pool.pinnedId || null,
       cursor: typeof raw.pool.cursor === 'number' ? raw.pool.cursor : 0,
+      stickyEnabled: raw.pool.stickyEnabled !== false,
+      stickyTtlMin: Number(raw.pool.stickyTtlMin) > 0 ? Number(raw.pool.stickyTtlMin) : 30,
     };
   }
   // 为出现过的每个渠道补齐默认池配置，避免运行期 poolOf 反复创建
@@ -162,9 +172,14 @@ function loadFromDb() {
       strategy: (cfg.pool && cfg.pool.strategy) || 'round-robin',
       pinnedId: (cfg.pool && cfg.pool.pinnedId) || null,
       cursor: (cfg.pool && typeof cfg.pool.cursor === 'number') ? cfg.pool.cursor : 0,
+      stickyEnabled: !cfg.pool || cfg.pool.stickyEnabled !== false,
+      stickyTtlMin: (cfg.pool && Number(cfg.pool.stickyTtlMin) > 0) ? Number(cfg.pool.stickyTtlMin) : 30,
     };
   }
   state = { version: 2, pools, accounts };
+  // 启动时清理陈旧绑定：停机期间进行中的任务视为已结束。
+  // 不清也能跑（会按 last_seen_at 惰性过期），但表会一直涨。
+  try { store.pruneSessionBindings(2 * 60 * 60 * 1000); } catch (e) { /* ignore */ }
   return true;
 }
 
@@ -233,10 +248,17 @@ function loadSession() {
 function persistPool() {
   if (!state) return;
   try {
-    // 池配置按渠道分别落库
+    // 池配置按渠道分别落库。
+    // 注意：这里必须**逐字段写全**。account_pool.config 是整体覆盖的 JSON，
+    // 少写一个字段就会把它从库里抹掉（下次 loadFromDb 读到缺失值 → 回默认值）。
     for (const [kind, p] of Object.entries(state.pools || {})) {
       store.setAccountPool({ version: 2, pool: {
-        mode: p.mode, strategy: p.strategy, pinnedId: p.pinnedId, cursor: p.cursor,
+        mode: p.mode,
+        strategy: p.strategy,
+        pinnedId: p.pinnedId,
+        cursor: p.cursor,
+        stickyEnabled: p.stickyEnabled !== false,
+        stickyTtlMin: Number(p.stickyTtlMin) > 0 ? Number(p.stickyTtlMin) : 30,
       } }, kind);
     }
     // 账号行以逐条 upsert 同步（以内存态为准）
@@ -284,6 +306,8 @@ function clearSession() {
   try {
     for (const r of store.listAccountRows()) store.deleteAccountRow(r.id);
     for (const kind of Object.keys(store.listAccountPools())) store.setAccountPool(store.defaultPoolConfig(), kind);
+    // 账号全清，绑定必然全部指向不存在的账号，一并清掉
+    store.deleteAllSessionBindings();
   } catch (e) { /* ignore */ }
 }
 
@@ -379,6 +403,9 @@ function removeAccount(id) {
     persistPool();
     try { store.deleteCheckinState(id); } catch (e) { /* ignore */ }
     try { store.deleteCreditSnapshots(id); } catch (e) { /* ignore */ }
+    // 必须连带删掉会话绑定：残留绑定指向已删除的账号，pickAccountForSession
+    // 每次都会判定失效并重新选，粘性等于静默失效（还会每次多查一次库）。
+    try { store.deleteSessionBindingsByAccount(id); } catch (e) { /* ignore */ }
   }
   return removed;
 }
@@ -403,6 +430,10 @@ function setPoolConfig(patch, provider) {
   if (patch.mode === 'pinned' || patch.mode === 'pool') p.mode = patch.mode;
   if (patch.strategy) p.strategy = patch.strategy;
   if (patch.pinnedId !== undefined) p.pinnedId = patch.pinnedId || null;
+  // 会话粘性开关。注意 stickyEnabled 是布尔，false 也是有效值，不能用
+  // `if (patch.x)` 判断 —— 那会让「关闭粘性」永远写不进去。
+  if (patch.stickyEnabled !== undefined) p.stickyEnabled = !!patch.stickyEnabled;
+  if (Number(patch.stickyTtlMin) > 0) p.stickyTtlMin = Number(patch.stickyTtlMin);
   persistPool();
   return getPoolConfig(provider);
 }
@@ -442,8 +473,130 @@ function pickAccount(explicitKey, provider) {
   if (!valid.length) return null;
   const cursor = ((p.cursor || 0) % valid.length + valid.length) % valid.length;
   p.cursor = (cursor + 1) % valid.length;
-  // cursor 只留在内存：轮询游标无需即时落库，重启后归零无害
+  // cursor 只留在内存：轮询游标无需即时落库，重启后归零无害。
+  // 注意这里**不能**像上游那样每次 pick 都 persistPool()——本地已刻意改成
+  // deferPersist→全量池重写，那会在流式响应中途阻塞事件循环，是本地修掉过的性能问题。
   return valid[cursor];
+}
+
+/* ---- 会话粘性（session stickiness） ---- */
+
+function hashKey(s) {
+  return crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 32);
+}
+
+/** 取消息的纯文本前若干字符，用于指纹 */
+function contentToText(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map(function (c) {
+      if (typeof c === 'string') return c;
+      if (c && typeof c === 'object') return typeof c.text === 'string' ? c.text : '';
+      return '';
+    }).filter(Boolean).join('\n');
+  }
+  if (typeof content === 'object') return contentToText(Array.isArray(content) ? content : [content]);
+  return String(content);
+}
+
+/** 会话指纹的一部分：全部 system 消息 + 第一条 user 消息 */
+function messagePrefixFingerprint(messages) {
+  if (!Array.isArray(messages) || !messages.length) return '';
+  const systems = [];
+  let firstUser = '';
+  for (const m of messages) {
+    if (!m || typeof m !== 'object') continue;
+    if (m.role === 'system' || m.role === 'developer') systems.push(contentToText(m.content).slice(0, 200));
+    else if (!firstUser && m.role === 'user') firstUser = contentToText(m.content).slice(0, 200);
+  }
+  return systems.join('\n---\n') + '\n@@@\n' + firstUser;
+}
+
+/**
+ * 计算会话键。**kind 必须参与哈希** —— 本项目是多渠道聚合：同一个客户端、同一段
+ * 系统提示词，可能同时打 cc/ 与 tc/ 的模型。若不把渠道算进去，两边会算出同一个
+ * session_key，粘性就会把 B 渠道绑定的账号发给 A 渠道的请求 —— 那等于把一个渠道的
+ * 凭据发去另一个渠道的上游域名。
+ *
+ * 优先级：
+ *   1. X-Session-Id 头（客户端显式声明，最权威）
+ *   2. API 密钥 id（同一密钥 = 同一使用方）
+ *   3. 对话前缀指纹（全部 system 消息 + 首条 user 消息，零配置）
+ */
+function computeSessionKey(kind, opts) {
+  const o = opts || {};
+  let raw = '';
+  if (o.sessionId) raw = 'sid:' + o.sessionId;
+  else if (o.apiKeyId) raw = 'key:' + o.apiKeyId;
+  else if (Array.isArray(o.messages) && o.messages.length) raw = 'fp:' + messagePrefixFingerprint(o.messages);
+  if (!raw) return null;
+  return hashKey((kind || 'codebuddy') + '|' + raw);
+}
+
+/** 绑定是否已过期（按渠道的 stickyTtlMin） */
+function bindingExpired(binding, now) {
+  if (!binding) return true;
+  const p = poolOf(binding.provider);
+  const ttlMin = Number(p.stickyTtlMin) > 0 ? Number(p.stickyTtlMin) : 30;
+  const last = Number(binding.lastSeenAt) || 0;
+  if (!last) return true;
+  return (now || Date.now()) - last > ttlMin * 60 * 1000;
+}
+
+/**
+ * 为一次「会话」选账号：有有效绑定就复用，否则轮询选一个并写绑定。
+ *
+ * 三重跨渠道防护（缺一不可）：
+ *   1. computeSessionKey 已把渠道混入哈希；
+ *   2. 绑定行里另存了 provider，这里再比对一次；
+ *   3. 取回的账号仍要过 inKind 过滤。
+ *
+ * @param {string|null} sessionKey
+ * @param {string} provider 渠道
+ * @returns {object|null} 账号
+ */
+function pickAccountForSession(sessionKey, provider) {
+  const kind = provider || 'codebuddy';
+  const inKind = (a) => !!a && (a.provider || 'codebuddy') === kind;
+  const p = poolOf(kind);
+
+  if (sessionKey && p.stickyEnabled !== false) {
+    const b = store.getSessionBinding(sessionKey);
+    if (b && b.provider === kind && !bindingExpired(b)) {
+      const acct = getAccount(b.accountId);
+      // 账号被删 / 渠道被改 / 令牌没了 -> 清掉陈旧绑定后重新选
+      if (acct && inKind(acct) && acct.auth && acct.auth.accessToken) {
+        store.touchSessionBinding(sessionKey);
+        return acct;
+      }
+      store.deleteSessionBinding(sessionKey);
+    } else if (b) {
+      store.deleteSessionBinding(sessionKey);   // 过期或渠道不符
+    }
+  }
+
+  const acct = pickAccount(null, kind);
+  if (acct && sessionKey && p.stickyEnabled !== false) {
+    try { store.setSessionBinding(sessionKey, acct.id, kind); } catch { /* 落库失败只是失去粘性，不影响请求 */ }
+  }
+  return acct;
+}
+
+/** 客户端声明会话结束（X-Session-End 头 / body 标记）时释放绑定 */
+function releaseSession(sessionKey) {
+  if (!sessionKey) return false;
+  try { return store.deleteSessionBinding(sessionKey) > 0; } catch { return false; }
+}
+
+/** 列出当前绑定（管理页诊断用；session_key 是哈希，不含消息内容） */
+/** 清理陈旧绑定（供调度器/启动调用） */
+function pruneSessionBindings(ttlMs) {
+  try { return store.pruneSessionBindings(ttlMs); } catch (e) { return 0; }
+}
+
+function listSessionBindings(limit) {
+  try { return store.listSessionBindings(limit); } catch { return []; }
 }
 
 /** 标记某账号被使用 */
@@ -521,6 +674,8 @@ module.exports = {
   listAccounts, accountCountsByProvider, getAccount, findAccountByIdOrName,
   addAccount, updateAccount, removeAccount,
   isExpiringAuth, pickAccount, markUsed, getActiveAccount,
+  // 会话粘性
+  computeSessionKey, pickAccountForSession, releaseSession, listSessionBindings, pruneSessionBindings,
   isLoggedIn, getSession, setSession, getSessionSource,
   flushPersist,
 };

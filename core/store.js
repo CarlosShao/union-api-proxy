@@ -274,6 +274,24 @@ function getDb() {
       updated_at    INTEGER NOT NULL DEFAULT 0
     );
 
+    -- 会话粘性绑定：把「一次对话」固定到同一个账号。
+    -- 没有它时每次请求都会轮换账号，agent 跑十几步工具调用就会换十几个账号，
+    -- 每个账号各自维护一份 prompt cache，命中率几乎归零。
+    -- 只存哈希，不存任何消息内容。
+    -- provider 列是本多渠道版本特有的：session_key 的计算已把渠道算进哈希，
+    -- 这里再存一份原值做二次校验，避免任何路径下的跨渠道复用（那会把 A 渠道
+    -- 的凭据发去 B 渠道的上游域名）。
+    CREATE TABLE IF NOT EXISTS session_bindings (
+      session_key  TEXT PRIMARY KEY,
+      account_id   TEXT NOT NULL,
+      provider     TEXT NOT NULL DEFAULT 'codebuddy',
+      bound_at     INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL,
+      req_count    INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_session_bindings_account ON session_bindings(account_id);
+    CREATE INDEX IF NOT EXISTS idx_session_bindings_seen ON session_bindings(last_seen_at);
+
     -- 每日积分快照（按账号），每天 0 时记录一次 usageUsed/usageLeft/usageTotal，
     -- 用于计算「今日消耗」（当前 usageUsed - 今日 0 时快照 usageUsed）。
     CREATE TABLE IF NOT EXISTS credit_snapshots (
@@ -1198,20 +1216,106 @@ function accountCount() {
   return getDb().prepare('SELECT COUNT(*) AS n FROM accounts').get().n;
 }
 
+/* ---- 会话粘性绑定（session_bindings） ---- */
+
+function rowToSessionBinding(r) {
+  if (!r) return null;
+  return {
+    sessionKey: r.session_key,
+    accountId: r.account_id,
+    provider: r.provider || 'codebuddy',
+    boundAt: r.bound_at,
+    lastSeenAt: r.last_seen_at,
+    reqCount: r.req_count || 0,
+  };
+}
+
+function getSessionBinding(sessionKey) {
+  if (!sessionKey) return null;
+  const r = getDb().prepare('SELECT * FROM session_bindings WHERE session_key = ?').get(String(sessionKey));
+  return rowToSessionBinding(r);
+}
+
+function setSessionBinding(sessionKey, accountId, provider) {
+  if (!sessionKey || !accountId) return null;
+  const now = Date.now();
+  getDb().prepare(
+    'INSERT INTO session_bindings(session_key, account_id, provider, bound_at, last_seen_at, req_count) ' +
+    'VALUES(?, ?, ?, ?, ?, 1) ' +
+    'ON CONFLICT(session_key) DO UPDATE SET account_id=excluded.account_id, ' +
+    'provider=excluded.provider, last_seen_at=excluded.last_seen_at, req_count=session_bindings.req_count + 1'
+  ).run(String(sessionKey), String(accountId), provider || 'codebuddy', now, now);
+  return getSessionBinding(sessionKey);
+}
+
+/** 复用已有绑定时刷新活跃时间并累加请求数 */
+function touchSessionBinding(sessionKey) {
+  if (!sessionKey) return;
+  try {
+    getDb().prepare('UPDATE session_bindings SET last_seen_at = ?, req_count = req_count + 1 WHERE session_key = ?')
+      .run(Date.now(), String(sessionKey));
+  } catch { /* 统计失败不该影响请求 */ }
+}
+
+function deleteSessionBinding(sessionKey) {
+  if (!sessionKey) return 0;
+  return getDb().prepare('DELETE FROM session_bindings WHERE session_key = ?').run(String(sessionKey)).changes;
+}
+
+/** 删除账号时必须连带清掉它的绑定，否则残留绑定会让选号每次都落空、粘性静默失效 */
+function deleteSessionBindingsByAccount(accountId) {
+  if (!accountId) return 0;
+  return getDb().prepare('DELETE FROM session_bindings WHERE account_id = ?').run(String(accountId)).changes;
+}
+
+function listSessionBindings(limit) {
+  const n = Number(limit) > 0 ? Number(limit) : 200;
+  return getDb().prepare('SELECT * FROM session_bindings ORDER BY last_seen_at DESC LIMIT ?').all(n).map(rowToSessionBinding);
+}
+
+/**
+ * 清理陈旧绑定。ttlMs 为空则用传入的倍数 * 基准 TTL。
+ * @param {number} ttlMs 存活时长
+ */
+function pruneSessionBindings(ttlMs) {
+  const ttl = Number(ttlMs) > 0 ? Number(ttlMs) : 30 * 60 * 1000;
+  return getDb().prepare('DELETE FROM session_bindings WHERE last_seen_at < ?').run(Date.now() - ttl).changes;
+}
+
+function deleteAllSessionBindings() {
+  return getDb().prepare('DELETE FROM session_bindings').run().changes;
+}
+
+function countSessionBindings() {
+  const r = getDb().prepare('SELECT COUNT(*) n FROM session_bindings').get();
+  return r ? (r.n || 0) : 0;
+}
+
 /* ---- 账号池配置（按渠道存储，version=2 固定） ---- */
 
 function defaultPoolConfig() {
-  return { version: 2, pool: { mode: 'pool', strategy: 'round-robin', pinnedId: null, cursor: 0 } };
+  return {
+    version: 2,
+    pool: { mode: 'pool', strategy: 'round-robin', pinnedId: null, cursor: 0, stickyEnabled: true, stickyTtlMin: 30 },
+  };
 }
 
-/** 读取指定渠道的账号池配置；provider 省略时用默认渠道（向后兼容旧调用） */
+/**
+ * 读取指定渠道的账号池配置。
+ * 关键：必须把默认字段**逐个**回填，而不能只做顶层 Object.assign ——
+ * cfg.pool 会整体替换默认 pool，缺字段就等于被丢弃。这里显式合并 pool 内层。
+ */
 function getAccountPool(provider) {
   const kind = provider || 'codebuddy';
   const r = getDb().prepare('SELECT config FROM account_pool WHERE provider = ?').get(kind);
-  if (!r) return defaultPoolConfig();
+  const def = defaultPoolConfig();
+  if (!r) return def;
   const cfg = safeParseJson(r.config, null);
-  if (!cfg || typeof cfg !== 'object') return defaultPoolConfig();
-  return Object.assign(defaultPoolConfig(), cfg);
+  if (!cfg || typeof cfg !== 'object') return def;
+  return {
+    version: 2,
+    pool: Object.assign({}, def.pool, (cfg.pool && typeof cfg.pool === 'object') ? cfg.pool : {}),
+  };
 }
 
 function setAccountPool(config, provider) {
@@ -1624,6 +1728,9 @@ module.exports = {
   listAccountRows, getAccountRow, insertAccount, updateAccountRow, deleteAccountRow, accountCount,
   accountCountByProvider, touchAccount,
   getAccountPool, setAccountPool, listAccountPools, defaultPoolConfig,
+  getSessionBinding, setSessionBinding, touchSessionBinding, deleteSessionBinding,
+  deleteSessionBindingsByAccount, listSessionBindings, pruneSessionBindings,
+  deleteAllSessionBindings, countSessionBindings,
 
   // 自动每日签到状态
   getCheckinState, listCheckinStates, setCheckinState, deleteCheckinState,

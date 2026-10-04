@@ -635,8 +635,10 @@ async function handleResponses(req, res) {
   }
 
   const accountKey = auth.extractAccountKey(req, payload);
+  // 会话粘性（与 /v1/chat/completions 同一套逻辑）
+  const sessionKey = auth.extractSessionKey(req, chatPayload.messages ? { messages: chatPayload.messages } : payload, resolved.kind, keyCheck.keyId || '');
   let acct;
-  try { acct = await auth.pickAccountForRequest(accountKey, keyCheck.accountId || '', resolved.kind); }
+  try { acct = await auth.pickAccountForRequest(accountKey, keyCheck.accountId || '', resolved.kind, sessionKey); }
   catch (e) {
     logger.log('warn', 'responses', `拒绝: ${e.message}`);
     util.sendJson(res, 401, { error: { message: e.message, type: 'authentication_error' } });

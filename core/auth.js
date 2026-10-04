@@ -80,7 +80,7 @@ async function getValidSession() {
  * @param {string} [keyAccountId] API 密钥绑定的账号 id（空 = 未绑定）
  * @param {string} [provider] 渠道标识
  */
-async function pickAccountForRequest(explicitKey, keyAccountId, provider) {
+async function pickAccountForRequest(explicitKey, keyAccountId, provider, sessionKey) {
   const kind = provider || 'codebuddy';
   const pool = sessionMod.getPoolConfig(kind);
   // 候选账号必须属于目标渠道，避免拿 A 渠道账号去请求 B 渠道
@@ -95,6 +95,9 @@ async function pickAccountForRequest(explicitKey, keyAccountId, provider) {
   } else if (keyAccountId) {
     const bound = sessionMod.findAccountByIdOrName(keyAccountId);
     acct = inKind(bound) ? bound : null;
+  } else if (sessionKey) {
+    // 池模式 + 有会话键 -> 走粘性：同一段对话固定落在同一账号，保住 prompt cache
+    acct = sessionMod.pickAccountForSession(sessionKey, kind);
   } else {
     acct = sessionMod.pickAccount(null, kind);
   }
@@ -122,6 +125,40 @@ function extractAccountKey(req, payload) {
     }
   }
   return null;
+}
+
+/**
+ * 计算本次请求的会话键（用于账号粘性）。
+ *
+ * 客户端可用 `X-Session-Id` 显式声明；不声明则退回「系统提示词 + 首条用户
+ * 消息」的指纹，做到零配置。渠道标识会混入哈希，保证 cc/ 与 tc/ 的会话互不串号。
+ *
+ * @param {object} req 原始请求
+ * @param {object} payload 已解析的请求体
+ * @param {string} provider 渠道
+ * @param {string} [apiKeyId] API 密钥 id（优先级低于显式 Session-Id）
+ * @returns {string|null} 会话键
+ */
+function extractSessionKey(req, payload, provider, apiKeyId) {
+  const h = req.headers || {};
+  const sid = h['x-session-id'] || h['x-conversation-id'];
+  const messages = payload && Array.isArray(payload.messages) ? payload.messages : null;
+  return sessionMod.computeSessionKey(provider, {
+    sessionId: sid ? String(sid).trim() : null,
+    apiKeyId: apiKeyId || null,
+    messages: messages,
+  });
+}
+
+/** 客户端声明「这段对话结束了」——释放绑定，让下一段对话可以重新分配账号 */
+function isSessionEnd(req, payload) {
+  const h = req.headers || {};
+  if (String(h['x-session-end'] || '') === '1') return true;
+  if (payload && typeof payload === 'object') {
+    if (payload.sessionEnd === true) return true;
+    if (payload.metadata && payload.metadata.sessionEnd === true) return true;
+  }
+  return false;
 }
 
 /**
@@ -382,7 +419,7 @@ module.exports = {
   buildNoAuthHeaders, buildAuthHeaders, buildChatRequestHeaders, authPath, isExpiring,
   CLI_VERSION,
   refreshToken, getValidAccount, getValidSession,
-  pickAccountForRequest, extractAccountKey,
+  pickAccountForRequest, extractAccountKey, extractSessionKey, isSessionEnd,
   verifyClientKey,
   fetchAuthState, pollAuthToken, fetchAccount, fetchAccounts, completeLogin,
   importByRefreshToken, fetchAccountByToken,
