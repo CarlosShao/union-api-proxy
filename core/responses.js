@@ -637,6 +637,10 @@ async function handleResponses(req, res) {
   const accountKey = auth.extractAccountKey(req, payload);
   // 会话粘性（与 /v1/chat/completions 同一套逻辑）
   const sessionKey = auth.extractSessionKey(req, chatPayload.messages ? { messages: chatPayload.messages } : payload, resolved.kind, keyCheck.keyId || '');
+  // 客户端声明会话结束 -> 释放绑定（挂在 res.close 上，覆盖流式/非流式所有出口）
+  if (sessionKey && auth.isSessionEnd(req, payload)) {
+    res.on('close', () => { try { require('./session').releaseSession(sessionKey); } catch { /* ignore */ } });
+  }
   let acct;
   try { acct = await auth.pickAccountForRequest(accountKey, keyCheck.accountId || '', resolved.kind, sessionKey); }
   catch (e) {

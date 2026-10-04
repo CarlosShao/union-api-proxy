@@ -8,6 +8,9 @@ const config = require('./config');
 const store = require('./store');
 const logger = require('./logger');
 const util = require('./util');
+// 惰性引用 session：session -> store，且 openai 已在 session 之前加载，
+// 顶层 require 会拿到半初始化的对象。
+const sessionModRelease = (key) => require('./session').releaseSession(key);
 const auth = require('./auth');
 const providers = require('./providers/all');
 const models = require('./models');
@@ -188,6 +191,11 @@ async function handleProxy(req, res, pathname) {
   // 会话粘性：同一段对话固定落在同一账号。没有它时每个请求都轮换账号，
   // agent 跑十几步工具调用就换十几个账号，prompt cache 命中率几乎归零。
   const sessionKey = auth.extractSessionKey(req, payload, resolved.kind, keyCheck.keyId || '');
+  // 客户端声明「这段对话结束了」（X-Session-End）时释放绑定，下一段对话可以重新分配。
+  // 挂在 res 的 close 上：流式/非流式、正常/异常的所有出口都会走到。
+  if (sessionKey && auth.isSessionEnd(req, payload)) {
+    res.on('close', () => { try { sessionModRelease(sessionKey); } catch { /* ignore */ } });
+  }
   let acct;
   if (selfCredential) {
     acct = endpoint; // 透传给 buildChatHeaders（openai-custom.buildChatHeaders 只吃 ep）
