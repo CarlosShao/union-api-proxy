@@ -203,5 +203,105 @@ check('responses：客户端未提思考时不凭空添加字段', () => {
   assert.strictEqual('reasoning_effort' in chat, false);
 });
 
+/* ---------------- /v1/responses 多模态分片不再被压平成文本 ---------------- */
+
+check('多模态：图片保持 image_url 分片，不再变成 base64 文本', () => {
+  const { responsesToChatInput } = require(path.join(ROOT, 'core', 'responses.js'));
+  const url = 'data:image/png;base64,AAAA';
+  const chat = responsesToChatInput({
+    model: 'm',
+    input: [{ role: 'user', content: [{ type: 'input_text', text: '看图' }, { type: 'input_image', image_url: url }] }],
+  });
+  const content = chat.messages[0].content;
+  assert.ok(Array.isArray(content), '含图片时 content 必须是分片数组');
+  assert.strictEqual(content[0].type, 'text');
+  assert.strictEqual(content[0].text, '看图');
+  assert.strictEqual(content[1].type, 'image_url');
+  assert.strictEqual(content[1].image_url.url, url, '图片地址必须原样保留');
+  assert.ok(!content[1].image_url.url.startsWith('data:image') || typeof content[1].image_url.url === 'string');
+  // 关键回归：base64 不得出现在任何 text 分片里
+  assert.ok(
+    !content.some((p) => p.type === 'text' && String(p.text).includes('base64')),
+    'base64 不得被当作文本发给上游'
+  );
+});
+
+check('多模态：Responses 字符串与 Chat {url} 两种写法都认，detail 保留', () => {
+  const { responsesToChatInput } = require(path.join(ROOT, 'core', 'responses.js'));
+  const chat = responsesToChatInput({
+    model: 'm',
+    input: [{ role: 'user', content: [
+      { type: 'input_image', image_url: 'https://a/1.png', detail: 'high' },
+      { type: 'image_url', image_url: { url: 'https://a/2.png', detail: 'low' } },
+    ] }],
+  });
+  const parts = chat.messages[0].content;
+  assert.strictEqual(parts[0].image_url.url, 'https://a/1.png');
+  assert.strictEqual(parts[0].image_url.detail, 'high');
+  assert.strictEqual(parts[1].image_url.url, 'https://a/2.png');
+  assert.strictEqual(parts[1].image_url.detail, 'low');
+});
+
+check('多模态：input_file / input_audio 原样透传，未知分片不再静默丢弃', () => {
+  const { responsesToChatInput } = require(path.join(ROOT, 'core', 'responses.js'));
+  const chat = responsesToChatInput({
+    model: 'm',
+    input: [{ role: 'user', content: [
+      { type: 'input_audio', input_audio: { data: 'AAA', format: 'wav' } },
+      { type: 'input_file', file_data: 'BBB' },
+      { type: 'some_future_part', foo: 1 },
+    ] }],
+  });
+  const parts = chat.messages[0].content;
+  assert.strictEqual(parts.length, 3);
+  assert.strictEqual(parts[0].type, 'input_audio');
+  assert.strictEqual(parts[1].type, 'input_file');
+  assert.strictEqual(parts[2].type, 'some_future_part', '未知分片必须保留');
+});
+
+check('多模态：纯文本仍返回字符串（不破坏只吃字符串的上游）', () => {
+  const { responsesToChatInput } = require(path.join(ROOT, 'core', 'responses.js'));
+  const chat = responsesToChatInput({
+    model: 'm',
+    input: [{ role: 'user', content: [{ type: 'input_text', text: 'a' }, { type: 'output_text', text: 'b' }] }],
+  });
+  assert.strictEqual(typeof chat.messages[0].content, 'string', '纯文本必须仍是字符串');
+  assert.strictEqual(chat.messages[0].content, 'a\nb');
+});
+
+check('多模态：净化只作用于文本分片，用户消息不会被整段改写', () => {
+  const { responsesToChatInput } = require(path.join(ROOT, 'core', 'responses.js'));
+  // 用户消息里的 OpenAI 只走短语净化，不应被 sanitizeText 全量替换
+  const chat = responsesToChatInput({
+    model: 'm',
+    input: [{ role: 'user', content: [{ type: 'input_text', text: 'compare OpenAI and Codex please' }] }],
+  });
+  assert.strictEqual(chat.messages[0].content, 'compare OpenAI and Codex please',
+    '用户消息的净化级别不得被图片改动顺带升级');
+});
+
+check('多模态：系统消息里的竞品词仍被净化（回归）', () => {
+  const { responsesToChatInput } = require(path.join(ROOT, 'core', 'responses.js'));
+  const chat = responsesToChatInput({
+    model: 'm',
+    input: [{ role: 'system', content: [{ type: 'input_text', text: 'You are Codex for OpenAI' }] }],
+  });
+  assert.ok(!/Codex|OpenAI/.test(chat.messages[0].content), '系统消息的竞品词净化不能被破坏');
+});
+
+check('多模态：tool 输出仍压平成字符串', () => {
+  const { responsesToChatInput } = require(path.join(ROOT, 'core', 'responses.js'));
+  const chat = responsesToChatInput({
+    model: 'm',
+    input: [
+      { type: 'function_call', call_id: 'c1', name: 'f', arguments: '{}' },
+      { type: 'function_call_output', call_id: 'c1', output: [{ type: 'input_text', text: 'ok' }] },
+    ],
+  });
+  const toolMsg = chat.messages.find((m) => m.role === 'tool');
+  assert.strictEqual(typeof toolMsg.content, 'string');
+  assert.strictEqual(toolMsg.content, 'ok');
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);
