@@ -211,7 +211,7 @@ async function handleProxy(req, res, pathname) {
       promptTokens: usage && usage.prompt_tokens,
       completionTokens: usage && usage.completion_tokens,
       totalTokens: usage && usage.total_tokens,
-      cachedTokens: usage && (usage.prompt_cache_hit_tokens || (usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens)),
+      cachedTokens: util.cachedTokensOf(usage),
       durationMs: Date.now() - startedAt,
       status,
     });

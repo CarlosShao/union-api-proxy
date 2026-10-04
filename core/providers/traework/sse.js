@@ -55,6 +55,31 @@ function parseSOLOEvent(eventName, dataLine) {
   return ev;
 }
 
+/**
+ * 归一化 token_usage：补上 OpenAI 形状的缓存字段。
+ *
+ * Trae SOLO 用的是 Anthropic 风格（cache_read_input_tokens /
+ * cache_creation_input_tokens），而 OpenAI 客户端（DSH / pi-ai / openai SDK）
+ * 只认 prompt_cache_hit_tokens / prompt_tokens_details.cached_tokens。
+ * 这里**在保留 Trae 原字段的前提下**补一份 OpenAI 形状的别名，两边都能读，
+ * 且不会丢掉 Trae 的原始信息。
+ *
+ * `*_total` 后缀那组是累计口径（同一响应里 total_tokens_total 恒为 0 而
+ * total_tokens 非 0），不是单次请求的值，故不参与映射。
+ */
+function normalizeUsage(raw) {
+  if (!raw || typeof raw !== 'object') return raw;
+  const out = Object.assign({}, raw);
+  const read = Number(raw.cache_read_input_tokens || 0) || 0;
+  const create = Number(raw.cache_creation_input_tokens || 0) || 0;
+  out.prompt_cache_hit_tokens = read;
+  out.prompt_tokens_details = Object.assign({}, raw.prompt_tokens_details, {
+    cached_tokens: read,
+    cache_write_tokens: create,
+  });
+  return out;
+}
+
 /** 把 SOLO tool_call 条目归一化为 OpenAI 标准结构（function_call -> function，清理私有字段） */
 function normalizeToolCalls(list) {
   if (!Array.isArray(list)) return null;
@@ -131,7 +156,7 @@ function createSseConverter() {
         break;
       }
       case 'token_usage':
-        state.pendingUsage = ev.usage;
+        state.pendingUsage = normalizeUsage(ev.usage);
         break;
       case 'done':
         // 上游 error 事件后常跟 done，避免重复收尾（[DONE] 之后不应再有帧）
@@ -248,7 +273,7 @@ function aggregate(sseText) {
         if (ev.toolCalls !== undefined) mergeToolCalls(toolCalls, normalizeToolCalls(ev.toolCalls));
         break;
       case 'token_usage':
-        usage = ev.usage;
+        usage = normalizeUsage(ev.usage);
         break;
       case 'done':
         if (ev.finishReason) finishReason = ev.finishReason;
@@ -327,4 +352,4 @@ function buildUpstreamError(code, message) {
   return { error: { message: msg, type: 'upstream_error', code: code || null, param: null } };
 }
 
-module.exports = { createSseConverter, aggregate, parseSOLOEvent, normalizeToolCalls };
+module.exports = { createSseConverter, aggregate, parseSOLOEvent, normalizeToolCalls, normalizeUsage };

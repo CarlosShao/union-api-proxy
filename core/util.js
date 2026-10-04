@@ -591,11 +591,42 @@ function synthesizeUpstreamError(status, fallback) {
   });
 }
 
+/**
+ * 从各家上游的 usage 里取「缓存命中的 prompt token 数」。
+ *
+ * 没有单一标准，必须都认：
+ *   - OpenAI chat:  usage.prompt_cache_hit_tokens / usage.prompt_tokens_details.cached_tokens
+ *   - OpenAI resp:   usage.input_tokens_details.cached_tokens
+ *   - Anthropic 系：usage.cache_read_input_tokens
+ *     （Trae SOLO 实测就用这个写法，见 providers/traework/sse.js 的 token_usage 事件）
+ *
+ * 此前只认前两种，导致 Trae 的缓存命中恒被记成 0 —— 上游就算真的命中了也看不到。
+ *
+ * 注意：Trae 还带一组 `*_total` 后缀字段（cache_read_input_tokens_total 等），
+ * 那是累计口径 —— 同一响应里 total_tokens_total 恒为 0 而 total_tokens 非 0 ——
+ * 不能当单次请求的缓存命中，故不参与匹配。
+ *
+ * @param {object} usage 上游返回的 usage 对象
+ * @returns {number} 缓存命中的 prompt token 数（无则 0）
+ */
+function cachedTokensOf(usage) {
+  if (!usage || typeof usage !== 'object') return 0;
+  const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  const ptd = usage.prompt_tokens_details;
+  const itd = usage.input_tokens_details;
+  return n(
+    usage.prompt_cache_hit_tokens
+    || (ptd && ptd.cached_tokens)
+    || (itd && itd.cached_tokens)
+    || usage.cache_read_input_tokens
+  );
+}
+
 module.exports = {
   requestJson, requestRaw, pipeToClient, pipeSseToClient, readBody,
   sendJson, sendHtml, sendFile, MIME_TYPES, corsHeaders,
   escapeHtml, maskedToken, genId, agentFor, synthesizeUpstreamError,
   normalizeReasoningEffort, resolveReasoningEffort,
   hasExplicitReasoningIntent, isReasoningDisabled, isReasoningEnabled,
-  normalizeDeveloperRole,
+  normalizeDeveloperRole, cachedTokensOf,
 };

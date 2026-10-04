@@ -211,7 +211,7 @@ function convertUsage(u) {
   if (!u) return null;
   return {
     input_tokens: u.prompt_tokens || 0,
-    input_tokens_details: { cached_tokens: u.prompt_cache_hit_tokens || 0 },
+    input_tokens_details: { cached_tokens: util.cachedTokensOf(u) },
     output_tokens: u.completion_tokens || 0,
     output_tokens_details: { reasoning_tokens: (u.completion_tokens_details && u.completion_tokens_details.reasoning_tokens) || 0 },
     total_tokens: u.total_tokens || 0,
@@ -542,10 +542,7 @@ async function handleResponses(req, res) {
   const accountId = acct ? acct.id : '';
   const accountName = acct ? (acct.name || (acct.account && (acct.account.nickname || acct.account.uid)) || '') : '';
   const record = (usage, status) => {
-    const cached =
-      (usage && usage.prompt_cache_hit_tokens) ||
-      (usage && usage.input_tokens_details && usage.input_tokens_details.cached_tokens) ||
-      (usage && usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens) || 0;
+    const cached = util.cachedTokensOf(usage);
     store.recordUsage({
       source: '/v1/responses',
       model: chatPayload.model || payload.model || '',
