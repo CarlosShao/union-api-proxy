@@ -110,6 +110,40 @@ async function pickAccountForRequest(explicitKey, keyAccountId, provider, sessio
   return valid;
 }
 
+/**
+ * 上游失败 -> 标记账号冷却。
+ *
+ * 冷却时长由**渠道自己的 classifyError** 决定，而不是一段与渠道无关的正则 ——
+ * 本项目是三渠道聚合，各家的错误码/错误体形状完全不同（Trae 用 code 1005 表示
+ * 额度不足，CodeBuddy 又是另一套）。用统一正则会对不上号：该冷却 30 分钟的额度
+ * 问题会只冷却 1 分钟。
+ *
+ * @param {string} accountId
+ * @param {number} status 上游 HTTP 状态码
+ * @param {string} body 上游错误体（截断到 4KB 即可）
+ * @param {object} [provider] 渠道实现；缺省按状态码粗判
+ * @returns {boolean} 是否已置入冷却
+ */
+function recordUpstreamFailure(accountId, status, body, provider) {
+  if (!accountId) return false;
+  let kind = 'none';
+  try {
+    if (provider && typeof provider.classifyError === 'function') {
+      kind = (provider.classifyError(status, body) || {}).kind || 'none';
+    } else if (status === 401 || status === 403) kind = 'session';
+    else if (status === 429) kind = 'rate';
+    else if (status >= 500) kind = 'server';
+  } catch (e) { return false; }
+  const ms = sessionMod.COOLDOWN_MS[kind];
+  if (!ms) return false;
+  return sessionMod.markUnhealthy(accountId, ms, kind + ':' + status);
+}
+
+/** 上游成功 -> 解除该账号的冷却 */
+function recordUpstreamSuccess(accountId) {
+  return sessionMod.markHealthy(accountId);
+}
+
 /** 从请求中提取账号指定值（header / body），并从 payload 中移除 */
 function extractAccountKey(req, payload) {
   const h = req.headers || {};
@@ -420,6 +454,7 @@ module.exports = {
   CLI_VERSION,
   refreshToken, getValidAccount, getValidSession,
   pickAccountForRequest, extractAccountKey, extractSessionKey, isSessionEnd,
+  recordUpstreamFailure, recordUpstreamSuccess,
   verifyClientKey,
   fetchAuthState, pollAuthToken, fetchAccount, fetchAccounts, completeLogin,
   importByRefreshToken, fetchAccountByToken,

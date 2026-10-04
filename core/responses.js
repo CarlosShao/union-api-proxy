@@ -649,8 +649,9 @@ async function handleResponses(req, res) {
     return;
   }
 
-  const accountId = acct ? acct.id : '';
-  const accountName = acct ? (acct.name || (acct.account && (acct.account.nickname || acct.account.uid)) || '') : '';
+  // 用 let：非流式失败转移换号后，用量要记到实际服务本次请求的账号上
+  let accountId = acct ? acct.id : '';
+  let accountName = acct ? (acct.name || (acct.account && (acct.account.nickname || acct.account.uid)) || '') : '';
   const record = (usage, status) => {
     const cached = util.cachedTokensOf(usage);
     store.recordUsage({
@@ -689,16 +690,69 @@ async function handleResponses(req, res) {
         const completion = typeof provider.aggregate === 'function'
           ? provider.aggregate(r.body) : openai.aggregateSseToCompletion(r.body);
         logger.log('info', 'responses', `完成 (${Date.now() - startedAt}ms)`, logger.requestSummary(payload, { stream: false, durationMs: Date.now() - startedAt, tokens: completion.usage && completion.usage.total_tokens }));
+        auth.recordUpstreamSuccess(accountId);
         record(completion.usage, 'ok');
         util.sendJson(res, 200, chatCompletionToResponse(completion, payload));
-      } else {
-        record(null, r.status === 200 ? 'ok' : 'error');
-        res.writeHead(r.status, { 'Content-Type': ct || 'application/json', 'Access-Control-Allow-Origin': '*' });
-        res.end(r.body);
+        return;
       }
+      // 上游报错：只有非流式、且客户端尚未收到任何字节时才允许换号重试一次。
+      // 流式路径在调用上游之前就已经 writeHead 过（res.headersSent 为真），
+      // 此时重发会造成重复输出，只能如实把错误透传。
+      const upstreamOk = r.status >= 200 && r.status < 300;
+      if (!upstreamOk && !res.headersSent
+          && !(accountKey || keyCheck.accountId)
+          && auth.recordUpstreamFailure(accountId, r.status, String(r.body || '').slice(0, 4096), provider)) {
+        const next = require('./session').pickFailoverAccount(accountId, resolved.kind);
+        if (next) {
+          try {
+            const valid = await auth.getValidAccount(next);
+            acct = valid;
+            accountId = valid.id || '';
+            accountName = valid.name || (valid.account && (valid.account.nickname || valid.account.uid)) || '';
+            if (sessionKey) { try { require('./session').rebindSession(sessionKey, accountId, resolved.kind); } catch { /* ignore */ } }
+            logger.log('warn', 'responses', `上游 ${r.status}，失败转移到账号 ${accountName || accountId}`, logger.requestSummary(payload, { status: r.status, provider: resolved.kind }));
+            return handleResponsesRetry(req, res, payload, resolved, provider, keyCheck, chatPayload, acct, accountId, accountName, sessionKey, startedAt, record);
+          } catch { /* 换号失败则按原样透传 */ }
+        }
+      }
+      record(null, upstreamOk ? 'ok' : 'error');
+      res.writeHead(r.status, { 'Content-Type': ct || 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(r.body);
     }
   } catch (e) {
     logger.log('error', 'responses', `上游错误: ${e.message}`, logger.requestSummary(payload, { durationMs: Date.now() - startedAt }));
+    record(null, 'error');
+    if (!res.headersSent) util.sendJson(res, 502, { error: { message: `upstream error: ${e.message}`, type: 'proxy_upstream_error' } });
+    else res.end();
+  }
+}
+
+/**
+ * 失败转移后的重试：只走非流式，且只做一次。
+ * 单独抽出来是为了让原路径保持线性可读，不被递归/循环撑大。
+ */
+async function handleResponsesRetry(req, res, payload, resolved, provider, keyCheck, chatPayload, acct, accountId, accountName, sessionKey, startedAt, record) {
+  const timeoutMs = store.getRequestTimeoutMs();
+  const headers = { ...provider.buildChatHeaders(acct), 'Content-Type': 'application/json' };
+  if (resolved.kind === 'codebuddy') headers['Accept'] = 'application/json';
+  const targetUrl = provider.chatUrl(acct);
+  const jsonBody = JSON.stringify(chatPayload);
+  try {
+    const r = await util.requestRaw(targetUrl, { method: 'POST', headers, body: jsonBody, timeoutMs });
+    const ct = (r.headers && r.headers['content-type']) || '';
+    const upstreamOk = r.status >= 200 && r.status < 300;
+    if (upstreamOk && (ct.includes('text/event-stream') || r.body.includes('chat.completion.chunk') || resolved.kind !== 'codebuddy')) {
+      const completion = typeof provider.aggregate === 'function'
+        ? provider.aggregate(r.body) : openai.aggregateSseToCompletion(r.body);
+      auth.recordUpstreamSuccess(accountId);
+      record(completion.usage, 'ok');
+      util.sendJson(res, 200, chatCompletionToResponse(completion, payload));
+      return;
+    }
+    record(null, upstreamOk ? 'ok' : 'error');
+    res.writeHead(r.status, { 'Content-Type': ct || 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(r.body);
+  } catch (e) {
     record(null, 'error');
     if (!res.headersSent) util.sendJson(res, 502, { error: { message: `upstream error: ${e.message}`, type: 'proxy_upstream_error' } });
     else res.end();

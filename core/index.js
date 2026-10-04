@@ -56,6 +56,25 @@ function start() {
     // 每日积分快照调度器（每天 0 时后记录每个账号的积分，用于计算今日消耗）
     creditScheduler.start();
 
+    // 额度缓存刷新：quota-weighted / least-used 选号依赖它。
+    // 不刷新的话额度数据永远不全，选号会一直退化成轮询（等于策略没生效）。
+    // 每 10 分钟刷一次，与 refreshQuotaCache 的默认节流一致。
+    (function startQuotaRefresh() {
+      const timer = setInterval(() => {
+        (async () => {
+          try {
+            const kinds = ['codebuddy', 'traework'];
+            for (const k of kinds) {
+              const pool = sessionMod.getPoolConfig(k);
+              if ((pool.strategy || 'round-robin') === 'round-robin') continue;   // 轮询无需额度
+              await sessionMod.refreshQuotaCache(k, 10);
+            }
+          } catch (e) { /* 刷新失败不影响服务 */ }
+        })();
+      }, 10 * 60 * 1000);
+      if (typeof timer.unref === 'function') timer.unref();
+    })();
+
     // 管理页鉴权：首次启动时初始化管理员密码（优先环境变量，否则生成一次性初始密码）
     let adminInitialPassword = '';
     if (!store.adminConfigured()) {

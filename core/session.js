@@ -88,6 +88,7 @@ function defaultPool(provider) {
     cursor: 0,
     stickyEnabled: true,   // 会话粘性：把一次对话固定到同一账号（保住 prompt cache）
     stickyTtlMin: 30,      // 绑定存活分钟数
+    failoverEnabled: true, // 上游失败时自动换一个账号重试一次
   };
 }
 
@@ -103,6 +104,7 @@ function normalizePoolsFromLegacy(raw, accounts) {
       cursor: typeof raw.pool.cursor === 'number' ? raw.pool.cursor : 0,
       stickyEnabled: raw.pool.stickyEnabled !== false,
       stickyTtlMin: Number(raw.pool.stickyTtlMin) > 0 ? Number(raw.pool.stickyTtlMin) : 30,
+      failoverEnabled: raw.pool.failoverEnabled !== false,
     };
   }
   // 为出现过的每个渠道补齐默认池配置，避免运行期 poolOf 反复创建
@@ -174,6 +176,7 @@ function loadFromDb() {
       cursor: (cfg.pool && typeof cfg.pool.cursor === 'number') ? cfg.pool.cursor : 0,
       stickyEnabled: !cfg.pool || cfg.pool.stickyEnabled !== false,
       stickyTtlMin: (cfg.pool && Number(cfg.pool.stickyTtlMin) > 0) ? Number(cfg.pool.stickyTtlMin) : 30,
+      failoverEnabled: !cfg.pool || cfg.pool.failoverEnabled !== false,
     };
   }
   state = { version: 2, pools, accounts };
@@ -259,6 +262,7 @@ function persistPool() {
         cursor: p.cursor,
         stickyEnabled: p.stickyEnabled !== false,
         stickyTtlMin: Number(p.stickyTtlMin) > 0 ? Number(p.stickyTtlMin) : 30,
+        failoverEnabled: p.failoverEnabled !== false,
       } }, kind);
     }
     // 账号行以逐条 upsert 同步（以内存态为准）
@@ -434,6 +438,7 @@ function setPoolConfig(patch, provider) {
   // `if (patch.x)` 判断 —— 那会让「关闭粘性」永远写不进去。
   if (patch.stickyEnabled !== undefined) p.stickyEnabled = !!patch.stickyEnabled;
   if (Number(patch.stickyTtlMin) > 0) p.stickyTtlMin = Number(patch.stickyTtlMin);
+  if (patch.failoverEnabled !== undefined) p.failoverEnabled = !!patch.failoverEnabled;
   persistPool();
   return getPoolConfig(provider);
 }
@@ -471,12 +476,253 @@ function pickAccount(explicitKey, provider) {
   }
   const valid = state.accounts.filter(function (a) { return inKind(a) && a.auth && a.auth.accessToken; });
   if (!valid.length) return null;
+  // pool.strategy 此前**从未被读取**——管理页能设 quota-weighted / least-used，
+  // 但选号一直是无条件轮询，设了等于没设。这里才真正按策略走。
+  const p2 = p;
+  if (p2.strategy && p2.strategy !== 'round-robin') {
+    const byStrategy = pickAccountByStrategy(kind);
+    if (byStrategy) return byStrategy;
+  }
   const cursor = ((p.cursor || 0) % valid.length + valid.length) % valid.length;
   p.cursor = (cursor + 1) % valid.length;
   // cursor 只留在内存：轮询游标无需即时落库，重启后归零无害。
   // 注意这里**不能**像上游那样每次 pick 都 persistPool()——本地已刻意改成
   // deferPersist→全量池重写，那会在流式响应中途阻塞事件循环，是本地修掉过的性能问题。
   return valid[cursor];
+}
+
+/* ---- 额度加权选号 ---- */
+
+/**
+ * 额度缓存：accountId -> { usageLeft, usageTotal, todayUsed, at }。
+ * 由 refreshQuotaCache() 异步填充。放内存，与冷却表同理：额度随时在变，
+ * 缓存意义在于「选号时不要同步等网络」。
+ */
+const quotaCache = new Map();
+
+function setQuotaCache(accountId, info) {
+  if (!accountId || !info) return false;
+  quotaCache.set(accountId, {
+    usageLeft: Number(info.usageLeft) || 0,
+    usageTotal: Number(info.usageTotal) || 0,
+    todayUsed: Number(info.todayUsed) || 0,
+    at: Date.now(),
+  });
+  return true;
+}
+
+function getQuotaCache(accountId) { return quotaCache.get(accountId) || null; }
+function clearQuotaCache() { quotaCache.clear(); }
+
+/**
+ * 候选账号里有多少比例拿得到额度数据。
+ * 低于全覆盖时**必须退化为轮询** —— 否则「只有一个账号有缓存」会把请求永远压到
+ * 那一个账号上（上游的 pickLeastUsed 就有这个饿死问题）。
+ */
+function quotaCoverage(candidates) {
+  if (!candidates.length) return 0;
+  let n = 0;
+  for (const a of candidates) if (quotaCache.has(a.id)) n++;
+  return n / candidates.length;
+}
+
+/** 按剩余额度占比加权随机挑一个（占比而非绝对值：避免大套餐账号长期霸占） */
+function pickQuotaWeighted(candidates) {
+  const weights = candidates.map((a) => {
+    const q = quotaCache.get(a.id);
+    if (!q || !(q.usageTotal > 0)) return 1;
+    const ratio = Math.max(0, Math.min(1, q.usageLeft / q.usageTotal));
+    // 完全没有额度（ratio=0）也要给一个极小权重之外的兜底：
+    // 真正的 0 会让该账号永远选不上，这里保留 0.05 的下限，
+    // 避免「额度为 0 的账号」在缓存过期期间彻底饿死、用户以为账号不存在。
+    return Math.max(ratio, 0.05);
+  });
+  const total = weights.reduce((s, w) => s + w, 0);
+  if (!(total > 0)) return candidates[0];
+  let r = Math.random() * total;
+  for (let i = 0; i < candidates.length; i++) {
+    r -= weights[i];
+    if (r <= 0) return candidates[i];
+  }
+  return candidates[candidates.length - 1];
+}
+
+/** 挑今日消耗最少的（均衡各账号的日消耗） */
+function pickLeastUsed(candidates) {
+  let best = null;
+  let bestVal = Infinity;
+  for (const a of candidates) {
+    const q = quotaCache.get(a.id);
+    const v = q ? q.todayUsed : 0;
+    if (v < bestVal) { bestVal = v; best = a; }
+  }
+  return best || candidates[0];
+}
+
+/**
+ * 按渠道池配置的 strategy 选号。
+ * 额度数据不完整时一律退化���轮询（宁可分布不均，也不要饿死某几个账号）。
+ */
+function pickAccountByStrategy(provider) {
+  const kind = provider || 'codebuddy';
+  const p = poolOf(kind);
+  const candidates = healthyAccounts(kind);
+  if (!candidates.length) return null;
+
+  const strategy = p.strategy || 'round-robin';
+  if (strategy === 'round-robin') {
+    const cursor = ((p.cursor || 0) % candidates.length + candidates.length) % candidates.length;
+    p.cursor = (cursor + 1) % candidates.length;
+    return candidates[cursor];
+  }
+  if (strategy !== 'quota-weighted' && strategy !== 'least-used') {
+    // 未知策略不静默退化：按轮询处理并在日志里能看出来（管理页也会显示原值）
+    const cursor = ((p.cursor || 0) % candidates.length + candidates.length) % candidates.length;
+    p.cursor = (cursor + 1) % candidates.length;
+    return candidates[cursor];
+  }
+  // 额度数据必须覆盖全部候选，否则退化轮询（见 quotaCoverage 的说明）
+  if (quotaCoverage(candidates) < 1) {
+    const cursor = ((p.cursor || 0) % candidates.length + candidates.length) % candidates.length;
+    p.cursor = (cursor + 1) % candidates.length;
+    return candidates[cursor];
+  }
+  return strategy === 'quota-weighted' ? pickQuotaWeighted(candidates) : pickLeastUsed(candidates);
+}
+
+/**
+ * 异步刷新某渠道各账号的额度缓存。失败只影响加权策略，不影响请求。
+ * @param {string} provider
+ * @param {number} limitMin 距上次刷新不足该分钟数则跳过
+ */
+async function refreshQuotaCache(provider, limitMin) {
+  const kind = provider || 'codebuddy';
+  const minMs = (Number(limitMin) > 0 ? Number(limitMin) : 10) * 60 * 1000;
+  const now = Date.now();
+  const accounts = healthyAccounts(kind);
+  let refreshed = 0;
+  for (const a of accounts) {
+    const prev = quotaCache.get(a.id);
+    if (prev && (now - prev.at) < minMs) continue;
+    try {
+      const credits = require('./credits');
+      const info = await credits.getCredits(a.id);
+      if (info && info.ok) { setQuotaCache(a.id, info); refreshed++; }
+    } catch (e) { /* 单个账号查失败不影响其它 */ }
+  }
+  return refreshed;
+}
+
+/* ---- 账号冷却（失败转移的底座） ---- */
+
+/**
+ * 冷却表：accountId -> { until, reason, at }。
+ * 刻意放内存不落库 —— 冷却是「当前这会儿用不了」，重启后应该立刻恢复可用，
+ * 落库反而会让一次偶发失败在重启后依然生效。
+ */
+const unhealthyMap = new Map();
+
+/** 各错误类型的冷却时长（毫秒）。没有条目的类型不做冷却。 */
+const COOLDOWN_MS = {
+  credit: 30 * 60 * 1000,   // 额度耗尽：等很久也不会自己好
+  session: 5 * 60 * 1000,   // 登录态失效：多半要重新登录
+  rate: 60 * 1000,          // 软限流：一分钟就够
+  server: 2 * 60 * 1000,    // 上游 5xx：稍等重试
+};
+
+function markUnhealthy(accountId, ms, reason) {
+  if (!accountId || !(ms > 0)) return false;
+  const now = Date.now();
+  const prev = unhealthyMap.get(accountId);
+  // 已有冷却时取更晚的到期时间，别让后一次较短的失败把冷却缩短
+  const until = Math.max(now + ms, prev ? prev.until : 0);
+  unhealthyMap.set(accountId, { until, reason: String(reason || ''), at: now });
+  return true;
+}
+
+function markHealthy(accountId) {
+  if (!accountId) return false;
+  return unhealthyMap.delete(accountId);
+}
+
+/** 清空全部冷却（管理页「解除全部冷却」用；也是回归测试重置状态用） */
+function clearUnhealthy() {
+  const n = unhealthyMap.size;
+  unhealthyMap.clear();
+  return n;
+}
+
+/** 该账号当前是否处于冷却中（顺带顺手清掉已过期的条目） */
+function isUnhealthy(accountId, now) {
+  const e = unhealthyMap.get(accountId);
+  if (!e) return false;
+  if ((now || Date.now()) >= e.until) { unhealthyMap.delete(accountId); return false; }
+  return true;
+}
+
+function getUnhealthy(accountId, now) {
+  if (!isUnhealthy(accountId, now)) return null;
+  return unhealthyMap.get(accountId);
+}
+
+function listUnhealthy(now) {
+  const t = now || Date.now();
+  const out = [];
+  for (const [accountId, e] of unhealthyMap.entries()) {
+    if (t >= e.until) { unhealthyMap.delete(accountId); continue; }
+    const acct = getAccount(accountId);
+    out.push({
+      accountId,
+      accountName: acct ? (acct.name || '') : '(已删除)',
+      provider: acct ? (acct.provider || 'codebuddy') : '',
+      until: e.until,
+      remainingMs: e.until - t,
+      reason: e.reason,
+    });
+  }
+  return out;
+}
+
+/**
+ * 某渠道下「当前可用」的账号：滤掉无 token、跨渠道、以及冷却中的。
+ *
+ * **provider 参数是必须的**。上游同名函数没有这个参数，照抄会把 inKind 过滤
+ * 整个丢掉 —— 于是 Trae 的账号能被 CodeBuddy 的请求选中，等于把一个渠道的
+ * 凭据发去另一个渠道的上游域名。
+ *
+ * @param {string} provider 渠道
+ * @param {object} [opts] { excludeId } 额外排除的账号（如刚失败的那个）
+ */
+function healthyAccounts(provider, opts) {
+  if (!state || !state.accounts.length) return [];
+  const kind = provider || 'codebuddy';
+  const inKind = (a) => (a.provider || 'codebuddy') === kind && a.auth && a.auth.accessToken;
+  const pool = state.accounts.filter(inKind);
+  if (!pool.length) return [];
+  const excludeId = opts && opts.excludeId;
+  const ok = pool.filter((a) => a.id !== excludeId && !isUnhealthy(a.id));
+  // 全被冷却/排除时退化为「忽略健康度」，避免一个都不能选直接报「没有可用账号」。
+  // 用原始池（仍受 inKind 约束）而不是全部账号。
+  return ok.length ? ok : pool.filter((a) => a.id !== excludeId) ;
+}
+
+/**
+ * 失败转移：给刚失败的账号换一个（尽量健康的）同渠道账号。
+ * @param {string} failedAccountId 刚失败的账号
+ * @param {string} provider 渠道
+ * @returns {object|null}
+ */
+function pickFailoverAccount(failedAccountId, provider) {
+  const kind = provider || 'codebuddy';
+  const p = poolOf(kind);
+  if (p.failoverEnabled === false) return null;      // 显式关闭
+  if (p.mode === 'pinned' && p.pinnedId) return null; // 指定模式下不擅自换号
+  const candidates = healthyAccounts(kind, { excludeId: failedAccountId });
+  if (!candidates.length) return null;
+  // 在候选里轮询，避免总是挑到同一个
+  const cursor = ((p.cursor || 0) % candidates.length + candidates.length) % candidates.length;
+  p.cursor = (cursor + 1) % candidates.length;
+  return candidates[cursor];
 }
 
 /* ---- 会话粘性（session stickiness） ---- */
@@ -589,6 +835,15 @@ function releaseSession(sessionKey) {
   try { return store.deleteSessionBinding(sessionKey) > 0; } catch { return false; }
 }
 
+/** 失败转移换号后，把已有绑定改指到新账号（否则下一次请求又被粘回坏账号） */
+function rebindSession(sessionKey, accountId, provider) {
+  if (!sessionKey || !accountId) return false;
+  try {
+    store.setSessionBinding(sessionKey, accountId, provider || 'codebuddy');
+    return true;
+  } catch { return false; }
+}
+
 /** 列出当前绑定（管理页诊断用；session_key 是哈希，不含消息内容） */
 /** 清理陈旧绑定（供调度器/启动调用） */
 function pruneSessionBindings(ttlMs) {
@@ -675,7 +930,12 @@ module.exports = {
   addAccount, updateAccount, removeAccount,
   isExpiringAuth, pickAccount, markUsed, getActiveAccount,
   // 会话粘性
-  computeSessionKey, pickAccountForSession, releaseSession, listSessionBindings, pruneSessionBindings,
+  computeSessionKey, pickAccountForSession, releaseSession, rebindSession, listSessionBindings, pruneSessionBindings,
+  // 账号冷却 / 失败转移
+  COOLDOWN_MS, markUnhealthy, markHealthy, clearUnhealthy, isUnhealthy, getUnhealthy, listUnhealthy,
+  healthyAccounts, pickFailoverAccount,
+  // 额度加权选号
+  setQuotaCache, getQuotaCache, clearQuotaCache, refreshQuotaCache, pickAccountByStrategy,
   isLoggedIn, getSession, setSession, getSessionSource,
   flushPersist,
 };

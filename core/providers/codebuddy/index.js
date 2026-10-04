@@ -165,10 +165,29 @@ function createSseConverter() {
 }
 
 /** 错误分类：映射到统一语义，供账号冷却/轮换使用 */
+/**
+ * 额度/配额耗尽的特征。
+ *
+ * 刻意**不**用宽泛的 /exceeded/ —— CodeBuddy 的上下文超限同样返回
+ * "context length exceeded"，那是请求本身的问题，给账号判 30 分钟冷却是错的
+ * （超限换账号一样会失败，冷却只会白白少一个可用账号）。
+ */
+const QUOTA_RE = new RegExp([
+  'insufficient\\s+(balance|quota|credit)',
+  'out\\s+of\\s+(quota|credit)',
+  'quota\\s*(exceeded|exhausted)',
+  'exceeded\\s+(your\\s+)?(quota|balance|credit)',
+  '(额度|积分不足|次数已用完|配额|余额不足)',
+].join('|'), 'i');
+
+/** 错误分类：映射到统一语义，供账号冷却/轮换使用 */
 function classifyError(status, body) {
   const text = String(body || '');
   if (status === 200) return { kind: 'none', fatal: false };
   if (status === 401 || status === 403) return { kind: 'session', fatal: true };
+  // 额度耗尽必须排在 429 与通用 4xx 之前：各家对「配额用完」的返回码不统一，
+  // 有时就是 400、有时是 429。判错会让账号只冷却 1 分钟而不是 30 分钟。
+  if (QUOTA_RE.test(text)) return { kind: 'credit', fatal: false };
   if (status === 429) return { kind: 'rate', fatal: false };
   // 11128 = 竞品词拦截；11101 = 参数错误；此类多为请求问题，冷却账号无意义
   if (text.includes('11128')) return { kind: 'content_filter', fatal: false };

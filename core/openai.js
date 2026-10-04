@@ -11,6 +11,8 @@ const util = require('./util');
 // 惰性引用 session：session -> store，且 openai 已在 session 之前加载，
 // 顶层 require 会拿到半初始化的对象。
 const sessionModRelease = (key) => require('./session').releaseSession(key);
+const sessionModPickFailover = (failedId, kind) => require('./session').pickFailoverAccount(failedId, kind);
+const sessionModRebind = (key, accountId, kind) => require('./session').rebindSession(key, accountId, kind);
 const auth = require('./auth');
 const providers = require('./providers/all');
 const models = require('./models');
@@ -208,8 +210,10 @@ async function handleProxy(req, res, pathname) {
     }
   }
 
-  const accountId = acct ? (acct.id || acct.baseUrl || '') : '';
-  const accountName = acct ? (acct.name || (acct.account && (acct.account.nickname || acct.account.uid)) || acct.baseUrl || '') : '';
+  // 必须用 let：失败转移换号后，用量要记到**实际服务本次请求**的那个账号上，
+  // 否则换号后用量仍挂在失败账号头上，统计会错。
+  let accountId = acct ? (acct.id || acct.baseUrl || '') : '';
+  let accountName = acct ? (acct.name || (acct.account && (acct.account.nickname || acct.account.uid)) || acct.baseUrl || '') : '';
 
   // 记录一次用量
   const record = (usage, status) => {
@@ -228,19 +232,24 @@ async function handleProxy(req, res, pathname) {
     });
   };
 
-  const headers = {
-    ...provider.buildChatHeaders(acct),
-    'Content-Type': 'application/json',
-    // 官方 CLI 即使流式也发 Accept: application/json（服务端按 body.stream 返回 SSE）；
-    // Trae / 自定义兼容 endpoint 侧由 provider 自己的头决定 Accept，故仅在缺省时补
-    'Accept': headersAcceptFor(resolved.kind),
-  };
-  // 目标地址：自带凭证渠道直接用 endpoint 的 baseUrl 拼路径；其它渠道沿用旧逻辑
-  let targetUrl;
-  if (selfCredential && endpoint) {
-    targetUrl = isChat ? provider.chatUrl(endpoint) : (upstreamPath === '/v1/embeddings' || upstreamPath === '/v2/embeddings' ? provider.embeddingsUrl(endpoint) : provider.completionsUrl(endpoint));
-  } else {
-    targetUrl = isChat ? provider.chatUrl(acct) : `${config.ENDPOINT}${upstreamPath}`;
+  /** 按当前 acct 构造本次尝试的请求头与目标地址（换号后要重建） */
+  function buildAttempt() {
+    const h = {
+      ...provider.buildChatHeaders(acct),
+      'Content-Type': 'application/json',
+      // 官方 CLI 即使流式也发 Accept: application/json（服务端按 body.stream 返回 SSE）；
+      // Trae / 自定义兼容 endpoint 侧由 provider 自己的头决定 Accept，故仅在缺省时补
+      'Accept': headersAcceptFor(resolved.kind),
+    };
+    // 目标地址：自带凭证渠道直接用 endpoint 的 baseUrl 拼路径；其它渠道沿用旧逻辑
+    let url;
+    if (selfCredential && endpoint) {
+      url = isChat ? provider.chatUrl(endpoint)
+        : (upstreamPath === '/v1/embeddings' || upstreamPath === '/v2/embeddings' ? provider.embeddingsUrl(endpoint) : provider.completionsUrl(endpoint));
+    } else {
+      url = isChat ? provider.chatUrl(acct) : `${config.ENDPOINT}${upstreamPath}`;
+    }
+    return { headers: h, targetUrl: url };
   }
   const startedAt = Date.now();
   // 渠道专属流转换器（Trae 的 SOLO 事件流需要转换；CodeBuddy / 自定义兼容 endpoint 返回 null 走默认路径）
@@ -271,7 +280,11 @@ async function handleProxy(req, res, pathname) {
     };
   })();
 
-  try {
+  /**
+   * 执行一次上游请求。返回 { ok, httpStatus } 供失败转移判断；
+   * 三条分支的响应写出行为与改造前完全一致。
+   */
+  async function runOnce(headers, targetUrl) {
     if (needAggregate) {
       const r = await util.requestRaw(targetUrl, { method: 'POST', headers, body: jsonBody, timeoutMs });
       const ct = (r.headers && r.headers['content-type']) || '';
@@ -281,37 +294,103 @@ async function handleProxy(req, res, pathname) {
       if (upstreamOk && (looksSse || resolved.kind !== 'codebuddy')) {
         const completion = aggregateFn(r.body);
         logger.log('info', 'proxy', `${pathname} 完成 (${Date.now() - startedAt}ms)`, logger.requestSummary(payload, { stream: false, status: 200, durationMs: Date.now() - startedAt, tokens: completion.usage && completion.usage.total_tokens }));
+        auth.recordUpstreamSuccess(accountId);
         record(completion.usage, 'ok');
         util.sendJson(res, 200, completion);
-      } else {
-        logger.log('warn', 'proxy', `${pathname} 上游非流式响应 ${r.status}`, logger.requestSummary(payload, { status: r.status, durationMs: Date.now() - startedAt }));
-        record(null, upstreamOk ? 'ok' : 'error');
-        // 上游错误体为空时合成一个：否则客户端只看到 "(no body)"，既无法诊断也识别不了溢出
-        const emptyErr = !upstreamOk && !String(r.body || '').trim();
-        const outBody = emptyErr ? util.synthesizeUpstreamError(r.status, errFallback) : r.body;
+        return { ok: true, httpStatus: r.status, body: r.body };
+      }
+      logger.log('warn', 'proxy', `${pathname} 上游非流式响应 ${r.status}`, logger.requestSummary(payload, { status: r.status, durationMs: Date.now() - startedAt }));
+      // 上游错误体为空时合成一个：否则客户端只看到 "(no body)"，既无法诊断也识别不了溢出
+      const emptyErr = !upstreamOk && !String(r.body || '').trim();
+      const outBody = emptyErr ? util.synthesizeUpstreamError(r.status, errFallback) : r.body;
+      if (!upstreamOk) {
         res.writeHead(r.status, {
           'Content-Type': emptyErr ? 'application/json; charset=utf-8' : (ct || 'application/json'),
           'Access-Control-Allow-Origin': '*',
         });
         res.end(outBody);
+        return { ok: false, httpStatus: r.status, body: String(r.body || '').slice(0, 4096) };
       }
-    } else if (isStream) {
+      record(null, 'ok');
+      return { ok: true, httpStatus: r.status, body: r.body };
+    }
+
+    if (isStream) {
+      // 流式：pipeSseToClient 只在上游确认 2xx 后才写客户端，
+      // 因此「上游直接报错」这种情况客户端还没收到任何字节，可以安全换号重试；
+      // 一旦正文开始下发（res.headersSent）就只能记账、不能重试。
+      let outcome = { ok: true, httpStatus: 0, body: '' };
       await util.pipeSseToClient(res, targetUrl, {
         method: 'POST', headers, body: jsonBody, converter, errorFallback: errFallback,
         extraHeaders: { 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' },
-      }, ({ usage, status }) => record(usage, status));
-      logger.log('info', 'proxy', `${pathname} 流式结束 (${Date.now() - startedAt}ms)`, logger.requestSummary(payload, { stream: true, durationMs: Date.now() - startedAt }));
-    } else {
-      const r = await util.requestJson(targetUrl, { method: 'POST', headers, body: jsonBody, timeoutMs });
-      logger.log('info', 'proxy', `${pathname} 完成 (${Date.now() - startedAt}ms)`, logger.requestSummary(payload, { stream: false, status: r.status, durationMs: Date.now() - startedAt }));
-      record(r.json && r.json.usage, r.status === 200 ? 'ok' : 'error');
-      const emptyErr = r.status >= 300 && !String(r.body || '').trim();
-      const outBody = emptyErr ? util.synthesizeUpstreamError(r.status, errFallback) : r.body;
-      res.writeHead(r.status, {
-        'Content-Type': emptyErr ? 'application/json; charset=utf-8' : ((r.headers && r.headers['content-type']) || 'application/json'),
-        'Access-Control-Allow-Origin': '*',
+      }, ({ usage, status, httpStatus, errorBody }) => {
+        outcome = { ok: status !== 'error', httpStatus: httpStatus || 0, body: errorBody || '' };
+        if (status !== 'error') auth.recordUpstreamSuccess(accountId);
+        record(usage, status);
       });
-      res.end(outBody);
+      logger.log('info', 'proxy', `${pathname} 流式结束 (${Date.now() - startedAt}ms)`, logger.requestSummary(payload, { stream: true, durationMs: Date.now() - startedAt }));
+      return outcome;
+    }
+
+    const r = await util.requestJson(targetUrl, { method: 'POST', headers, body: jsonBody, timeoutMs });
+    logger.log('info', 'proxy', `${pathname} 完成 (${Date.now() - startedAt}ms)`, logger.requestSummary(payload, { stream: false, status: r.status, durationMs: Date.now() - startedAt }));
+    const ok = r.status >= 200 && r.status < 300;
+    if (ok) auth.recordUpstreamSuccess(accountId);
+    record(r.json && r.json.usage, ok ? 'ok' : 'error');
+    const emptyErr = r.status >= 300 && !String(r.body || '').trim();
+    const outBody = emptyErr ? util.synthesizeUpstreamError(r.status, errFallback) : r.body;
+    res.writeHead(r.status, {
+      'Content-Type': emptyErr ? 'application/json; charset=utf-8' : ((r.headers && r.headers['content-type']) || 'application/json'),
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.end(outBody);
+    return { ok, httpStatus: r.status, body: String(r.body || '').slice(0, 4096) };
+  }
+
+  /**
+   * 失败转移：换一个账号重试**一次**。
+   *
+   * 四个必须成立的前提，缺一不可：
+   *   1. 客户端还没收到任何字节（res.headersSent）—— 否则重发会造成重复输出；
+   *   2. 不是自带凭证渠道 —— 那是用户自己配的 endpoint，换账号等于换错服务；
+   *   3. 账号不是用户显式指定的 —— 请求头指定 / API 密钥绑定 / pinned 都属明确选择，
+   *      擅自换号等于违背用户意图；
+   *   4. 只换同渠道的账号（pickFailoverAccount 内部带 inKind 过滤）。
+   *
+   * 注意风险：非流式重试会把整个请求体重发一次，若第一次其实在上游成功、
+   * 只是响应分类被误判，就可能重复计费。下面的门禁只允许对
+   * 「明确属于账号/额度/限流类」的错误重试，其余一律不重试。
+   */
+  async function tryFailover(httpStatus, body) {
+    if (res.headersSent) return false;
+    if (selfCredential) return false;
+    if (accountKey || keyCheck.accountId) return false;   // 用户显式指定
+    const marked = auth.recordUpstreamFailure(accountId, httpStatus, body, provider);
+    if (!marked) return false;                             // 不是账号侧的问题，不换号
+    const next = sessionModPickFailover(accountId, resolved.kind);
+    if (!next) return false;
+    try {
+      const valid = await auth.getValidAccount(next);
+      acct = valid;
+      accountId = valid.id || '';
+      accountName = valid.name || (valid.account && (valid.account.nickname || valid.account.uid)) || '';
+      // 会话粘性绑定也要跟着换到新账号，否则下一次请求又被粘回坏账号
+      if (sessionKey) { try { sessionModRebind(sessionKey, accountId, resolved.kind); } catch { /* ignore */ } }
+      logger.log('warn', 'proxy', `${pathname} 上游 ${httpStatus}，失败转移到账号 ${accountName || accountId}`, logger.requestSummary(payload, { status: httpStatus, provider: resolved.kind }));
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  try {
+    for (let attempt = 0; ; attempt++) {
+      const { headers, targetUrl } = buildAttempt();
+      const outcome = await runOnce(headers, targetUrl);
+      // 只在第一次失败、且能安全换号时重试一次
+      if (outcome.ok || attempt >= 1) break;
+      const retried = await tryFailover(outcome.httpStatus, outcome.body);
+      if (!retried) break;
     }
   } catch (e) {
     logger.log('error', 'proxy', `${pathname} 上游错误: ${e.message}`, logger.requestSummary(payload, { stream: isStream, durationMs: Date.now() - startedAt }));

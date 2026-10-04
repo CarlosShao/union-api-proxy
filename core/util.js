@@ -126,7 +126,13 @@ function normalizeSseBlock(block) {
 
 /**
  * 把上游 SSE 流转发到客户端，同时解析其中的 token 用量。
- * onDone({ usage, status }) 在流结束时回调。usage 为 OpenAI chat.completion.chunk 里的 usage 对象。
+ * onDone({ usage, status, httpStatus, errorBody }) 在流结束时回调。
+ *   usage      — OpenAI chat.completion.chunk 里的 usage 对象
+ *   status     — 'ok' | 'error'
+ *   httpStatus — 上游 HTTP 状态码（失败转移要靠它判断 401/429/额度等）
+ *   errorBody  — 上游错误体前 4KB（非 2xx 时才有；空错误体时为空串）
+ *
+ * httpStatus / errorBody 是失败转移的输入：调用方据此判断该不该换一个账号重试。
  * 兼容 `stream_options.include_usage` 的最后一块，也兼容流结束后单独追加的 usage 块。
  *
  * converter：可选的渠道专属「上游流 -> OpenAI SSE」转换器（如 Trae 的 SOLO 事件流）。
@@ -146,7 +152,9 @@ function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, bod
 
     let usage = null;
     let status = 'ok';
-    const report = () => { if (onDone) try { onDone({ usage, status }); } catch { /* ignore */ } };
+    let httpStatus = 0;
+    let errorBody = '';
+    const report = () => { if (onDone) try { onDone({ usage, status, httpStatus, errorBody }); } catch { /* ignore */ } };
 
     // CODEBUDDY_DEBUG 下记录 chunk 间隙：用于定位事件循环停顿 / 上游断流造成的秒级思考分段
     const debugGaps = !!process.env.CODEBUDDY_DEBUG;
@@ -170,6 +178,7 @@ function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, bod
 
     const upstream = mod.request(u, { method, headers: finalHeaders, agent: agentFor(u.protocol) }, (upRes) => {
       const upstreamOk = upRes.statusCode >= 200 && upRes.statusCode < 300;
+      httpStatus = upRes.statusCode || 0;
 
       // 上游报错：原始体直接透传，不能喂给转换器（会把错误文本转成空回复）。
       // 但若上游给的是**空错误体**，客户端（如 DSH）拿不到任何错误信息，
@@ -181,6 +190,9 @@ function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, bod
         upRes.on('error', (e) => { report(); reject(e); });
         upRes.on('end', () => {
           const raw = Buffer.concat(errChunks);
+          // 截断留存给调用方判断失败原因（额度不足 / 登录态失效 / 限流…）。
+          // 4KB 足够覆盖各家错误体的关键字段，又不至于把大 body 带进内存。
+          errorBody = raw.toString('utf8').slice(0, 4096);
           const headers = { ...(upRes.headers || {}), ...extraHeaders };
           if (raw.toString('utf8').trim()) {
             clientRes.writeHead(upRes.statusCode || 502, headers);

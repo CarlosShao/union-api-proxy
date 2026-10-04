@@ -1296,7 +1296,7 @@ function countSessionBindings() {
 function defaultPoolConfig() {
   return {
     version: 2,
-    pool: { mode: 'pool', strategy: 'round-robin', pinnedId: null, cursor: 0, stickyEnabled: true, stickyTtlMin: 30 },
+    pool: { mode: 'pool', strategy: 'round-robin', pinnedId: null, cursor: 0, stickyEnabled: true, stickyTtlMin: 30, failoverEnabled: true },
   };
 }
 
