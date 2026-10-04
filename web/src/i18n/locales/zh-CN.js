@@ -14,6 +14,7 @@ export default {
     settings: '系统配置',
     login: '登录',
     github: 'GitHub',
+    versionTitle: '版本号来自服务端 package.json',
   },
   common: {
     loading: '加载中…',

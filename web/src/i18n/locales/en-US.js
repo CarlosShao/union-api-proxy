@@ -14,6 +14,7 @@ export default {
     settings: 'Settings',
     login: 'Sign in',
     github: 'GitHub',
+    versionTitle: 'Version comes from the server package.json',
   },
   common: {
     loading: 'Loading…',
