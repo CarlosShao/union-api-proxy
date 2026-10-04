@@ -1,6 +1,6 @@
 {
   "name": "union-api-proxy",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Union API Proxy：把多渠道（CodeBuddy / Trae CN）登录态聚合为 OpenAI 兼容接口，附 Vite+Vue 管理页",
   "license": "MIT",
   "author": "MrWhat",

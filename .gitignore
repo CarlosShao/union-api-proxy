@@ -7,3 +7,6 @@ dist/
 # 系统
 .DS_Store
 *.log
+
+# 数据库备份（含 accessToken / refreshToken 等登录凭据，严禁入库）
+backups/
