@@ -132,6 +132,16 @@ function responsesToChatInput(p, opts) {
   if (p.temperature !== undefined) chat.temperature = p.temperature;
   if (p.top_p !== undefined) chat.top_p = p.top_p;
 
+  // 思考强度：Responses API 用 reasoning:{effort} 表达思考档位，但上游只认 chat 的
+  // `reasoning_effort` 字符串。这里先原样带到 chatPayload，再由渠道的 preparePayload
+  // （CodeBuddy 见 util.resolveReasoningEffort）统一归一化——Responses 请求体里的
+  // reasoning 对象会被上游 Go 反序列化拒绝，必须在这里转掉，不能直接透传。
+  if (p.reasoning !== undefined) chat.reasoning = p.reasoning;
+  if (p.reasoning_effort !== undefined) chat.reasoning_effort = p.reasoning_effort;
+  if (p.reasoningEffort !== undefined) chat.reasoningEffort = p.reasoningEffort;
+  if (p.thinking !== undefined) chat.thinking = p.thinking;
+  if (p.enableThinking !== undefined) chat.enableThinking = p.enableThinking;
+
   return chat;
 }
 
@@ -527,4 +537,5 @@ async function handleResponses(req, res) {
   }
 }
 
-module.exports = { handleResponses };
+// responsesToChatInput 导出以便回归测试直接驱动（见 test/reasoning.js）
+module.exports = { handleResponses, responsesToChatInput };

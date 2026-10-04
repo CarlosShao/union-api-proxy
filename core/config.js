@@ -78,6 +78,9 @@ const DEFAULT_CONFIG = {
   'autoOpen': env('NO_OPEN', '') ? 'false' : 'true',
   'defaultModel': env('DEFAULT_MODEL', 'default'),
   'forceModel': env('FORCE_MODEL', ''),
+  // 默认思考强度：CodeBuddy 上游只有在请求带非空 reasoning_effort 时才返回
+  // reasoning_content（思维链），不传则思考默认关闭。留空 = 不主动添加该字段。
+  'defaultReasoningEffort': env('DEFAULT_REASONING_EFFORT', 'medium'),
   'apiKeyEnabled': 'true',                            // 是否校验客户端访问 /v1 与 /responses 所需的 API 密钥
   'apiKey': env('API_KEY', ''),                       // 兼容旧版：单个 API 密钥（新实现优先使用 api_keys 表）
   'adminAuthEnabled': 'false',         // 是否开启管理页/管理接口鉴权（登录后访问）

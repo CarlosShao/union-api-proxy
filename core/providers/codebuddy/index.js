@@ -10,6 +10,7 @@
 
 const config = require('../../config');
 const util = require('../../util');
+const store = require('../../store');
 const auth = require('../../auth');
 const sanitize = require('../../sanitize');
 const models = require('../../models');
@@ -70,19 +71,30 @@ async function listModels(acct) {
 }
 
 /**
- * 净化请求体：把竞品品牌词/指纹句改写掉，绕过上游 11128 拦截。
- * 这是 CodeBuddy 独有的适配，**不要**套用到其它渠道。
+ * 净化请求体：把竞品品牌词/指纹句改写掉，绕过上游 11128 拦截；
+ * 同时归一化 `developer` 角色与思考强度。
+ * 这些都是 CodeBuddy 独有的上游约束，**不要**套用到其它渠道。
  */
 function preparePayload(payload) {
-  // CodeBuddy 上游 `/v2/chat/completions` 不识别 OpenAI 的 `developer` 角色：
+  if (!payload) return payload;
+
+  // 思考强度归一化。上游只认 `reasoning_effort` 字符串：传 bool/对象等会 400 11101，
+  // 且只有带上非空 effort 才会返回 reasoning_content（思维链）。客户端没提时回落
+  // 默认档位（defaultReasoningEffort），留空则保持上游「思考关闭」的默认行为。
+  try {
+    util.resolveReasoningEffort(payload, store.getConfig().defaultReasoningEffort);
+  } catch (_e) {
+    // 配置读取失败不应拖垮请求：退化为只清理非法别名，不擅自加档位
+    util.resolveReasoningEffort(payload, '');
+  }
+
+  // 角色归一化：CodeBuddy 上游 `/v2/chat/completions` 不识别 OpenAI 的 `developer` 角色：
   // 请求里一旦出现该角色，整包会被安全策略判为「Illegal API invocation from an unapproved
   // channel」(11128) 直接拒绝——与消息内容无关，纯粹由角色名触发渠道校验。
   // Codex / dsh 等 OpenAI 兼容客户端用 `developer` 承载系统提示词，须降级为语义等价的 `system`。
-  if (payload && Array.isArray(payload.messages)) {
+  if (Array.isArray(payload.messages)) {
     const msgs = payload.messages;
-    for (const m of msgs) {
-      if (m && m.role === 'developer') m.role = 'system';
-    }
+    util.normalizeDeveloperRole(payload);
     // 降级后若出现多条 system 消息，合并进第一条，避免部分上游拒绝多 system。
     const systems = msgs.filter((m) => m && m.role === 'system');
     if (systems.length > 1) {
